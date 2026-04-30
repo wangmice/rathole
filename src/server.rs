@@ -8,6 +8,7 @@ use crate::protocol::{
     self, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello, UdpTraffic,
     HASH_WIDTH_IN_BYTES,
 };
+use crate::forward::forward_bidirectional_with_idle_timeout;
 use crate::transport::{SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
@@ -17,7 +18,7 @@ use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time;
@@ -37,6 +38,18 @@ const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP serv
 const UDP_POOL_SIZE: usize = 2; // The number of cached connections for UDP services
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
+
+// Surface the outcome of a forwarder task. Only the leak-guard reaper
+// (the typed `PostHalfCloseIdleTimeout` sentinel) is debug-level; generic
+// `TimedOut` from a transport could indicate a real handshake / keepalive
+// problem and stays at warn.
+fn log_forwarder_outcome(kind: &'static str, e: &io::Error) {
+    if crate::forward::is_post_half_close_idle_timeout(e) {
+        debug!("Forwarder ({}) reaped by post-half-close idle timeout", kind);
+    } else {
+        warn!("Forwarder ({}) ended with error: {}", kind, e);
+    }
+}
 
 // The entrypoint of running a server
 pub async fn run_server(
@@ -348,8 +361,12 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         conn.flush().await?;
 
         info!(service = %service_config.name, "Control channel established");
-        let handle =
-            ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval);
+        let handle = ControlChannelHandle::new(
+            conn,
+            service_config,
+            server_config.heartbeat_interval,
+            server_config.post_half_close_idle_timeout.as_duration(),
+        );
 
         // Insert the new handle
         let _ = h.insert(service_digest, session_key, handle);
@@ -403,6 +420,7 @@ where
         conn: T::Stream,
         service: ServerServiceConfig,
         heartbeat_interval: u64,
+        post_half_close_idle_timeout: Option<Duration>,
     ) -> ControlChannelHandle<T> {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -432,6 +450,7 @@ where
                 async move {
                     if let Err(e) = run_tcp_connection_pool::<T>(
                         bind_addr,
+                        post_half_close_idle_timeout,
                         data_ch_rx,
                         data_ch_req_tx,
                         shutdown_rx_clone,
@@ -625,6 +644,7 @@ fn tcp_listen_and_send(
 #[instrument(skip_all)]
 async fn run_tcp_connection_pool<T: Transport>(
     bind_addr: String,
+    post_half_close_idle_timeout: Option<Duration>,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     shutdown_rx: broadcast::Receiver<bool>,
@@ -632,21 +652,37 @@ async fn run_tcp_connection_pool<T: Transport>(
     let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
 
-    'pool: while let Some(mut visitor) = visitor_rx.recv().await {
+    'pool: while let Some(visitor) = visitor_rx.recv().await {
+        let mut visitor = Some(visitor);
         loop {
             if let Some(mut ch) = data_ch_rx.recv().await {
                 if write_and_flush(&mut ch, &cmd).await.is_ok() {
+                    let v = visitor.take().unwrap();
                     tokio::spawn(async move {
-                        let _ = copy_bidirectional(&mut ch, &mut visitor).await;
+                        if let Err(e) = forward_bidirectional_with_idle_timeout(
+                            ch,
+                            v,
+                            post_half_close_idle_timeout,
+                        )
+                        .await
+                        {
+                            log_forwarder_outcome("tcp", &e);
+                        }
                     });
                     break;
                 } else {
-                    // Current data channel is broken. Request for a new one
+                    // Current data channel is broken. Request for a new one.
                     if data_ch_req_tx.send(true).is_err() {
+                        if let Some(mut v) = visitor.take() {
+                            let _ = AsyncWriteExt::shutdown(&mut v).await;
+                        }
                         break 'pool;
                     }
                 }
             } else {
+                if let Some(mut v) = visitor.take() {
+                    let _ = AsyncWriteExt::shutdown(&mut v).await;
+                }
                 break 'pool;
             }
         }
