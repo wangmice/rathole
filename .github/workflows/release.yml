@@ -85,7 +85,8 @@ jobs:
         run: rustup target add ${{ matrix.target }}
       - name: Run tests
         if: matrix.cross == false && matrix.target != 'aarch64-apple-darwin'
-        run: cargo test --release --target ${{ matrix.target }} --verbose 
+        timeout-minutes: 20
+        run: cargo test --release --target ${{ matrix.target }} --verbose -- --test-threads=1
       - name: Build release
         if: matrix.cross == false 
         run: cargo build --release --target ${{ matrix.target }}
@@ -93,10 +94,13 @@ jobs:
       # Cross build
       - name: Install cross
         if: matrix.cross
-        run: cargo install --version 0.2.5 cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
       - name: Run tests
         if: matrix.cross
-        run: cross test --release --target ${{ matrix.target }} --verbose --features embedded --no-default-features
+        timeout-minutes: 20
+        run: cross test --release --target ${{ matrix.target }} --verbose --features embedded --no-default-features -- --test-threads=1
       - name: Build release
         if: matrix.cross
         run: cross build --release --target ${{ matrix.target }} --features embedded --no-default-features
