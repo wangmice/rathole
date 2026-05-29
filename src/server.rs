@@ -362,9 +362,8 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         let mut h = control_channels.write().await;
 
         // If there's already a control channel for the service, then drop the old one.
-        // Because a control channel doesn't report back when it's dead,
-        // the handle in the map could be stall, dropping the old handle enables
-        // the client to reconnect.
+        // This handles reconnects that arrive before the previous control channel's
+        // cleanup task has removed its handle from the map.
         if h.remove1(&service_digest).is_some() {
             warn!(
                 "Dropping previous control channel for service {}",
@@ -383,6 +382,9 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             service_config,
             server_config.heartbeat_interval,
             server_config.post_half_close_idle_timeout.as_duration(),
+            service_digest,
+            session_key,
+            control_channels.clone(),
         );
 
         // Insert the new handle
@@ -438,6 +440,9 @@ where
         service: ServerServiceConfig,
         heartbeat_interval: u64,
         post_half_close_idle_timeout: Option<Duration>,
+        service_digest: ServiceDigest,
+        session_key: Nonce,
+        control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     ) -> ControlChannelHandle<T> {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -507,10 +512,19 @@ where
         };
 
         // Run the control channel
+        let service_name = service.name.clone();
         tokio::spawn(
             async move {
                 if let Err(err) = ch.run().await {
                     error!("{:#}", err);
+                }
+
+                if control_channels.write().await.remove2(&session_key).is_some() {
+                    debug!(
+                        service = %service_name,
+                        digest = %hex::encode(service_digest),
+                        "Removed stale control channel"
+                    );
                 }
             }
             .instrument(Span::current()),

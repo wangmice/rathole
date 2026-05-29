@@ -1,0 +1,10 @@
+[server]
+bind_addr = "127.0.0.1:3395"
+default_token = "default_token_if_not_specify"
+heartbeat_interval = 1
+
+[server.transport]
+type = "tcp"
+
+[server.services.cleanup]
+bind_addr = "127.0.0.1:3396"
