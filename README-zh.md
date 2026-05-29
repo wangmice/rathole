@@ -2,11 +2,11 @@
 
 ![rathole-logo](./docs/img/rathole-logo.png)
 
-[![GitHub stars](https://img.shields.io/github/stars/rapiz1/rathole)](https://github.com/rapiz1/rathole/stargazers)
-[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/rapiz1/rathole)](https://github.com/rapiz1/rathole/releases)
-![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/rapiz1/rathole/rust.yml?branch=main)
-[![GitHub all releases](https://img.shields.io/github/downloads/rapiz1/rathole/total)](https://github.com/rapiz1/rathole/releases)
-[![Docker Pulls](https://img.shields.io/docker/pulls/rapiz1/rathole)](https://hub.docker.com/r/rapiz1/rathole)
+[![GitHub stars](https://img.shields.io/github/stars/verofess/rathole-ng)](https://github.com/verofess/rathole-ng/stargazers)
+[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/verofess/rathole-ng)](https://github.com/verofess/rathole-ng/releases)
+![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/verofess/rathole-ng/rust.yml?branch=main)
+[![GitHub all releases](https://img.shields.io/github/downloads/verofess/rathole-ng/total)](https://github.com/verofess/rathole-ng/releases)
+[![GHCR image](https://img.shields.io/badge/ghcr.io-verofess%2Frathole--ng-blue)](https://github.com/verofess/rathole-ng/pkgs/container/rathole-ng)
 
 [English](README.md) | [简体中文](README-zh.md)
 
@@ -36,7 +36,11 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 
 ## Quickstart
 
-一个全功能的 `rathole` 可以从 [release](https://github.com/rapiz1/rathole/releases) 页面下载。或者 [从源码编译](docs/build-guide.md) **获取其他平台和最小化的二进制文件**。
+一个全功能的 `rathole` 可以从 [release](https://github.com/verofess/rathole-ng/releases) 页面下载。或者 [从源码编译](docs/build-guide.md) **获取其他平台和最小化的二进制文件**。也可以从 GHCR 拉取 Docker image：
+
+```sh
+docker pull ghcr.io/verofess/rathole-ng:latest
+```
 
 `rathole` 的使用和 frp 非常类似，如果你有后者的使用经验，那配置对你来说非常简单，区别只是转发服务的配置分离到了服务端和客户端，并且必须要设置 token。
 

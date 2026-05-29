@@ -10,6 +10,8 @@ RUN cp target/release/rathole build-out/
 
 
 FROM gcr.io/distroless/cc-debian12
+LABEL org.opencontainers.image.source="https://github.com/verofess/rathole-ng"
+LABEL org.opencontainers.image.url="https://github.com/verofess/rathole-ng"
 WORKDIR /app
 COPY --from=builder /home/rust/src/build-out/rathole .
 USER 1000:1000
