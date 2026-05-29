@@ -172,6 +172,8 @@ pub struct TcpConfig {
     #[serde(default)]
     pub fast_open: bool,
     #[serde(default)]
+    pub quickack: bool,
+    #[serde(default)]
     pub msg_zerocopy: bool,
     pub proxy: Option<Url>,
 }
@@ -183,6 +185,7 @@ impl Default for TcpConfig {
             keepalive_secs: default_keepalive_secs(),
             keepalive_interval: default_keepalive_interval(),
             fast_open: false,
+            quickack: false,
             msg_zerocopy: false,
             proxy: None,
         }
@@ -737,6 +740,7 @@ type = "tcp"
 "#,
         )
         .unwrap();
+        assert!(!parsed.tcp.quickack);
         assert!(!parsed.tcp.msg_zerocopy);
         assert!(!parsed.io_uring_zc_rx.enabled);
         assert_eq!(
@@ -791,10 +795,12 @@ recv_len = 32768
 type = "tcp"
 
 [tcp]
+quickack = true
 msg_zerocopy = true
 "#,
         )
         .unwrap();
+        assert!(parsed.tcp.quickack);
         assert!(parsed.tcp.msg_zerocopy);
     }
 }

@@ -120,6 +120,7 @@ nodelay = true # Optional. Determine whether to enable TCP_NODELAY, if applicabl
 keepalive_secs = 20 # Optional. Specify `tcp_keepalive_time` in `tcp(7)`, if applicable. Default: 20 seconds
 keepalive_interval = 8 # Optional. Specify `tcp_keepalive_intvl` in `tcp(7)`, if applicable. Default: 8 seconds
 fast_open = false # Optional. Enable TCP Fast Open on supported platforms. Default: false
+quickack = false # Optional. Re-arm Linux TCP_QUICKACK after successful TCP reads. Default: false
 msg_zerocopy = false # Optional. Linux MSG_ZEROCOPY send path for TCP writes that must pass through userspace. Default: false
 
 [client.transport.io_uring_zc_rx] # Optional. Experimental Linux io_uring zero-copy receive path. Also affects `tcp`, `tls`, `noise`, and `websocket`.
@@ -167,6 +168,7 @@ nodelay = true
 keepalive_secs = 20
 keepalive_interval = 8
 fast_open = false
+quickack = false
 msg_zerocopy = false
 
 [server.transport.io_uring_zc_rx] # Same as the client
@@ -223,6 +225,12 @@ If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay =
 `fast_open = true` under `[client.transport.tcp]` and `[server.transport.tcp]` enables TCP Fast Open where the platform supports it. On Linux, `rathole` sets `TCP_FASTOPEN_CONNECT` for outbound TCP connections and `TCP_FASTOPEN` for listeners. Platforms or kernels that do not support these socket options log a warning and continue with regular TCP.
 
 The option only applies to the underlying TCP sockets, so it also affects TLS, Noise, and WebSocket transports. It does not replace application-layer authentication, and the operating system may require its own TCP Fast Open sysctl or policy settings before the feature is actually used on the wire.
+
+### `quickack`
+
+`quickack = true` under `[client.transport.tcp]` and `[server.transport.tcp]` enables Linux `TCP_QUICKACK` for the transport TCP sockets. `TCP_QUICKACK` is a one-shot hint rather than a persistent mode, so `rathole` re-arms it after each successful TCP read that yields bytes. Platforms that do not support `TCP_QUICKACK` log a warning and continue with normal delayed ACK behavior.
+
+This only affects the tunnel TCP sockets owned by the transport. Plain TCP forwarding still keeps its `splice` data path when possible; when that path is active, `rathole` re-arms `TCP_QUICKACK` on the tunnel side after successful splice reads.
 
 ### `msg_zerocopy`
 

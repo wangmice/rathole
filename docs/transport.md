@@ -18,6 +18,22 @@ The setting is shared by all transports that use TCP underneath, including TCP, 
 
 The operating system can still gate TCP Fast Open with sysctl or network policy, so enabling this option in `rathole` only requests TFO from the socket layer.
 
+## TCP_QUICKACK
+
+Linux `TCP_QUICKACK` can be enabled with `quickack = true` in `[client.transport.tcp]` and `[server.transport.tcp]`:
+
+```toml
+[client.transport.tcp]
+quickack = true
+
+[server.transport.tcp]
+quickack = true
+```
+
+`TCP_QUICKACK` is not a permanent socket mode. It is a one-shot hint that asks the kernel to send ACKs immediately instead of delaying them until TCP's internal state changes again. Because of that, `rathole` re-arms the option after each successful transport TCP read that yields bytes, including reads under TLS, Noise, and WebSocket. If the platform does not support `TCP_QUICKACK`, `rathole` logs the fallback and keeps normal delayed ACK behavior.
+
+The option applies to the tunnel TCP sockets owned by the transport. Plain TCP forwarding continues to use Linux `splice` whenever possible; on that path, `rathole` re-arms `TCP_QUICKACK` on the tunnel side after successful splice reads.
+
 ## MSG_ZEROCOPY
 
 Linux `MSG_ZEROCOPY` can be enabled with `msg_zerocopy = true` in `[client.transport.tcp]` and `[server.transport.tcp]`:

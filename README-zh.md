@@ -117,6 +117,7 @@ nodelay = true # Optional. Override the `client.transport.nodelay` per service
 keepalive_secs = 20 # Optional. Specify `tcp_keepalive_time` in `tcp(7)`, if applicable. Default: 20 seconds
 keepalive_interval = 8 # Optional. Specify `tcp_keepalive_intvl` in `tcp(7)`, if applicable. Default: 8 seconds
 fast_open = false # Optional. 在支持的平台上启用 TCP Fast Open。默认: false
+quickack = false # Optional. 每次成功读取 TCP 数据后重新提示 Linux TCP_QUICKACK。默认: false
 msg_zerocopy = false # Optional. Linux MSG_ZEROCOPY 发送路径，用于必须经过用户态的 TCP 写入。默认: false
 
 [client.transport.io_uring_zc_rx] # Optional. Experimental Linux io_uring zero-copy receive path. Also affects `tcp`, `tls`, `noise`, and `websocket`.
@@ -163,6 +164,7 @@ nodelay = true
 keepalive_secs = 20
 keepalive_interval = 8
 fast_open = false # Optional. 在支持的平台上启用 TCP Fast Open。默认: false
+quickack = false
 msg_zerocopy = false
 
 [server.transport.io_uring_zc_rx] # Same as the client
@@ -221,6 +223,12 @@ RUST_LOG=error ./rathole config.toml
 `[client.transport.tcp]` 和 `[server.transport.tcp]` 下的 `fast_open = true` 会在平台支持时启用 TCP Fast Open。在 Linux 上，`rathole` 会对出站 TCP 连接设置 `TCP_FASTOPEN_CONNECT`，对监听 socket 设置 `TCP_FASTOPEN`。如果当前平台或内核不支持这些 socket option，会记录 warning 并继续使用普通 TCP。
 
 这个选项只作用于底层 TCP socket，因此也会影响 TLS、Noise 和 WebSocket transport。它不会替代应用层认证；操作系统可能还需要额外的 TCP Fast Open sysctl 或策略设置，才能真正在线路上使用 TFO。
+
+### `quickack`
+
+`[client.transport.tcp]` 和 `[server.transport.tcp]` 下的 `quickack = true` 会在 Linux 上为 transport 持有的 TCP socket 启用 `TCP_QUICKACK`。`TCP_QUICKACK` 不是持久模式，而是一次性提示；因此 `rathole` 会在每次成功读到 TCP 数据后重新设置它。当前平台不支持 `TCP_QUICKACK` 时，会记录 warning 并继续使用普通 delayed ACK 行为。
+
+这个选项只作用于 transport 底层的 tunnel TCP socket。明文 TCP 转发只要能使用 `splice`，仍会保留 `splice` 数据路径；在这条路径上，`rathole` 会在 tunnel 侧成功完成 splice 读取后重新设置 `TCP_QUICKACK`。
 
 ### `msg_zerocopy`
 

@@ -46,7 +46,7 @@ impl Transport for TcpTransport {
         let (s, addr) = a.accept().await?;
         self.socket_opts.apply(&s);
         Ok((
-            MaybeZcRxTcpStream::new(s, &self.zc_rx, self.cfg.msg_zerocopy),
+            MaybeZcRxTcpStream::new(s, &self.zc_rx, self.cfg.msg_zerocopy, self.cfg.quickack),
             addr,
         ))
     }
@@ -62,6 +62,7 @@ impl Transport for TcpTransport {
             s,
             &self.zc_rx,
             self.cfg.msg_zerocopy,
+            self.cfg.quickack,
         ))
     }
 
@@ -81,7 +82,8 @@ async fn forward_tcp(
     idle: Option<Duration>,
 ) -> io::Result<()> {
     let config = data_channel.io_uring_zc_rx_config().clone();
-    let peer = MaybeZcRxTcpStream::new(peer, &config, false);
+    let data_channel_quickack = data_channel.quickack_active();
+    let peer = MaybeZcRxTcpStream::new(peer, &config, false, false);
     if data_channel.is_zc_rx_active() || peer.is_zc_rx_active() {
         debug!("Using io_uring ZC Rx TCP forwarding");
         return crate::forward::forward_bidirectional_with_idle_timeout(data_channel, peer, idle)
@@ -91,7 +93,14 @@ async fn forward_tcp(
     let data_channel = into_tcp_stream(data_channel)?;
     let peer = into_tcp_stream(peer)?;
     debug!("Using splice zero-copy TCP forwarding");
-    crate::forward::splice_bidirectional_with_idle_timeout(data_channel, peer, idle).await
+    crate::forward::splice_bidirectional_with_idle_timeout_and_quickack(
+        data_channel,
+        peer,
+        idle,
+        data_channel_quickack,
+        false,
+    )
+    .await
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -101,7 +110,7 @@ async fn forward_tcp(
     idle: Option<Duration>,
 ) -> io::Result<()> {
     let config = data_channel.io_uring_zc_rx_config().clone();
-    let peer = MaybeZcRxTcpStream::new(peer, &config, false);
+    let peer = MaybeZcRxTcpStream::new(peer, &config, false, false);
     crate::forward::forward_bidirectional_with_idle_timeout(data_channel, peer, idle).await
 }
 

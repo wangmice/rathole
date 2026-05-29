@@ -9,6 +9,8 @@
 //! respond protocol semantics that `tokio::io::copy_bidirectional` provides.
 
 #[cfg(target_os = "linux")]
+use crate::tcp_quickack::TcpQuickAck;
+#[cfg(target_os = "linux")]
 use std::os::unix::io::{AsRawFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
@@ -82,10 +84,12 @@ where
 /// transports still have to pass through userspace because their stream bytes
 /// are encrypted or framed above the socket layer.
 #[cfg(target_os = "linux")]
-pub(crate) async fn splice_bidirectional_with_idle_timeout(
+pub(crate) async fn splice_bidirectional_with_idle_timeout_and_quickack(
     a: TcpStream,
     b: TcpStream,
     idle: Option<Duration>,
+    a_quickack: bool,
+    b_quickack: bool,
 ) -> io::Result<()> {
     let a = Arc::new(a);
     let b = Arc::new(b);
@@ -93,8 +97,13 @@ pub(crate) async fn splice_bidirectional_with_idle_timeout(
     let (atob_arm_tx, atob_arm_rx) = oneshot::channel::<Duration>();
     let (btoa_arm_tx, btoa_arm_rx) = oneshot::channel::<Duration>();
 
-    let atob = splice_pump(a.clone(), b.clone(), atob_arm_rx);
-    let btoa = splice_pump(b, a, btoa_arm_rx);
+    let atob = splice_pump(
+        a.clone(),
+        b.clone(),
+        atob_arm_rx,
+        TcpQuickAck::new(a_quickack),
+    );
+    let btoa = splice_pump(b, a, btoa_arm_rx, TcpQuickAck::new(b_quickack));
     tokio::pin!(atob);
     tokio::pin!(btoa);
 
@@ -125,6 +134,7 @@ async fn splice_pump(
     reader: Arc<TcpStream>,
     writer: Arc<TcpStream>,
     mut arm_idle: oneshot::Receiver<Duration>,
+    mut quickack: TcpQuickAck,
 ) -> io::Result<()> {
     let pipe = Pipe::new()?;
     let mut idle: Option<Duration> = None;
@@ -137,6 +147,7 @@ async fn splice_pump(
             if buffered == 0 {
                 return shutdown_socket_write(&writer);
             }
+            quickack.rearm(&reader);
         }
 
         while buffered > 0 {
@@ -777,10 +788,12 @@ mod tests {
         let (mut left_client, left_proxy) = tcp_pair().await.unwrap();
         let (mut right_client, right_proxy) = tcp_pair().await.unwrap();
 
-        let fwd = tokio::spawn(splice_bidirectional_with_idle_timeout(
+        let fwd = tokio::spawn(splice_bidirectional_with_idle_timeout_and_quickack(
             left_proxy,
             right_proxy,
             Some(Duration::from_secs(2)),
+            true,
+            true,
         ));
 
         let exchange = async {

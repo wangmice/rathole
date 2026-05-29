@@ -8,6 +8,7 @@ mod io_uring_zc_rx;
 mod msg_zerocopy;
 mod multi_map;
 mod protocol;
+mod tcp_quickack;
 mod transport;
 
 pub use cli::Cli;

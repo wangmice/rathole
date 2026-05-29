@@ -1,4 +1,4 @@
-use crate::{config::IoUringZcRxConfig, msg_zerocopy::MsgZeroCopyTx};
+use crate::{config::IoUringZcRxConfig, msg_zerocopy::MsgZeroCopyTx, tcp_quickack::TcpQuickAck};
 use std::fmt::{self, Debug};
 use std::io;
 use std::pin::Pin;
@@ -13,12 +13,18 @@ use self::sys::{start_zc_rx, ZcRxReadHalf};
 pub struct MaybeZcRxTcpStream {
     rx: Option<ZcRxReadHalf>,
     tx: Option<MsgZeroCopyTx>,
+    quickack: TcpQuickAck,
     inner: TcpStream,
     config: IoUringZcRxConfig,
 }
 
 impl MaybeZcRxTcpStream {
-    pub(crate) fn new(inner: TcpStream, config: &IoUringZcRxConfig, msg_zerocopy: bool) -> Self {
+    pub(crate) fn new(
+        inner: TcpStream,
+        config: &IoUringZcRxConfig,
+        msg_zerocopy: bool,
+        quickack: bool,
+    ) -> Self {
         let rx = if config.enabled {
             match start_zc_rx(&inner, config) {
                 Ok(rx) => {
@@ -34,10 +40,12 @@ impl MaybeZcRxTcpStream {
             None
         };
         let tx = MsgZeroCopyTx::new(&inner, msg_zerocopy);
+        let quickack = TcpQuickAck::new(quickack);
 
         Self {
             rx,
             tx,
+            quickack,
             inner,
             config: config.clone(),
         }
@@ -49,6 +57,11 @@ impl MaybeZcRxTcpStream {
 
     pub(crate) fn io_uring_zc_rx_config(&self) -> &IoUringZcRxConfig {
         &self.config
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn quickack_active(&self) -> bool {
+        self.quickack.is_active()
     }
 
     #[cfg(target_os = "linux")]
@@ -72,6 +85,7 @@ impl Debug for MaybeZcRxTcpStream {
             .field("inner", &self.inner)
             .field("zc_rx_active", &self.rx.is_some())
             .field("msg_zerocopy_active", &self.tx.is_some())
+            .field("quickack_active", &self.quickack.is_active())
             .finish()
     }
 }
@@ -82,11 +96,17 @@ impl AsyncRead for MaybeZcRxTcpStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if let Some(rx) = self.rx.as_mut() {
+        let before = buf.filled().len();
+        let me = self.as_mut().get_mut();
+        let result = if let Some(rx) = me.rx.as_mut() {
             rx.poll_read(cx, buf)
         } else {
-            Pin::new(&mut self.inner).poll_read(cx, buf)
+            Pin::new(&mut me.inner).poll_read(cx, buf)
+        };
+        if matches!(result, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            me.quickack.rearm(&me.inner);
         }
+        result
     }
 }
 
@@ -776,7 +796,7 @@ mod tests {
         let server_config = config.clone();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut stream = MaybeZcRxTcpStream::new(stream, &server_config, false);
+            let mut stream = MaybeZcRxTcpStream::new(stream, &server_config, false, false);
             let mut buf = [0; 4];
             stream.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, b"ping");
@@ -784,7 +804,7 @@ mod tests {
         });
 
         let stream = TcpStream::connect(addr).await.unwrap();
-        let mut stream = MaybeZcRxTcpStream::new(stream, &config, false);
+        let mut stream = MaybeZcRxTcpStream::new(stream, &config, false, false);
         stream.write_all(b"ping").await.unwrap();
         let mut buf = [0; 4];
         stream.read_exact(&mut buf).await.unwrap();
@@ -800,7 +820,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut stream = MaybeZcRxTcpStream::new(stream, &config, true);
+            let mut stream = MaybeZcRxTcpStream::new(stream, &config, true, false);
             let mut buf = vec![0; 32 * 1024];
             stream.read_exact(&mut buf).await.unwrap();
             assert!(buf.iter().all(|&b| b == 7));
@@ -809,12 +829,38 @@ mod tests {
         });
 
         let stream = TcpStream::connect(addr).await.unwrap();
-        let mut stream = MaybeZcRxTcpStream::new(stream, &IoUringZcRxConfig::default(), true);
+        let mut stream =
+            MaybeZcRxTcpStream::new(stream, &IoUringZcRxConfig::default(), true, false);
         let payload = vec![7; 32 * 1024];
         stream.write_all(&payload).await.unwrap();
         let mut buf = vec![0; 32 * 1024];
         stream.read_exact(&mut buf).await.unwrap();
         assert!(buf.iter().all(|&b| b == 9));
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wrapper_forwards_data_with_quickack_enabled() {
+        let config = IoUringZcRxConfig::default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = MaybeZcRxTcpStream::new(stream, &config, false, true);
+            let mut buf = [0; 4];
+            stream.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut stream =
+            MaybeZcRxTcpStream::new(stream, &IoUringZcRxConfig::default(), false, true);
+        stream.write_all(b"ping").await.unwrap();
+        let mut buf = [0; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pong");
 
         server.await.unwrap();
     }
