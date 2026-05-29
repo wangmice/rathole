@@ -216,6 +216,12 @@ From v0.4.7, rathole enables TCP_NODELAY by default, which should benefit the la
 
 If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay = false`.
 
+### TCP Fast Open
+
+`fast_open = true` under `[client.transport.tcp]` and `[server.transport.tcp]` enables TCP Fast Open where the platform supports it. On Linux, `rathole` sets `TCP_FASTOPEN_CONNECT` for outbound TCP connections and `TCP_FASTOPEN` for listeners. Platforms or kernels that do not support these socket options log a warning and continue with regular TCP.
+
+The option only applies to the underlying TCP sockets, so it also affects TLS, Noise, and WebSocket transports. It does not replace application-layer authentication, and the operating system may require its own TCP Fast Open sysctl or policy settings before the feature is actually used on the wire.
+
 ### `io_uring_zc_rx`
 
 `[client.transport.io_uring_zc_rx]` and `[server.transport.io_uring_zc_rx]` enable an experimental Linux receive-side zero-copy path based on `IORING_OP_RECV_ZC`. When enabled, `rathole` tries to register io_uring ZC Rx for TCP streams and falls back to the existing TCP path if the kernel, NIC, queue, or platform does not support it. Plain TCP forwarding still uses Linux `splice` when ZC Rx is unavailable.

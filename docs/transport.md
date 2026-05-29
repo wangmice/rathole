@@ -2,6 +2,22 @@
 
 By default, `rathole` forwards traffic as it is. Different options can be enabled to secure the traffic.
 
+## TCP Fast Open
+
+TCP Fast Open can be enabled with `fast_open = true` in `[client.transport.tcp]` and `[server.transport.tcp]`:
+
+```toml
+[client.transport.tcp]
+fast_open = true
+
+[server.transport.tcp]
+fast_open = true
+```
+
+The setting is shared by all transports that use TCP underneath, including TCP, TLS, Noise, and WebSocket. On Linux, `rathole` sets `TCP_FASTOPEN_CONNECT` for outbound sockets and `TCP_FASTOPEN` for listeners. If the socket option is unavailable, `rathole` logs a warning and falls back to regular TCP.
+
+The operating system can still gate TCP Fast Open with sysctl or network policy, so enabling this option in `rathole` only requests TFO from the socket layer.
+
 ## io_uring ZC Rx
 
 `rathole` can optionally try Linux io_uring zero-copy receive through `[client.transport.io_uring_zc_rx]` and `[server.transport.io_uring_zc_rx]`. The option is global for the transport block and applies to TCP, TLS, Noise, and WebSocket because all of them sit on top of TCP sockets.

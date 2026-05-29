@@ -116,7 +116,7 @@ proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. The proxy used to conn
 nodelay = true # Optional. Override the `client.transport.nodelay` per service
 keepalive_secs = 20 # Optional. Specify `tcp_keepalive_time` in `tcp(7)`, if applicable. Default: 20 seconds
 keepalive_interval = 8 # Optional. Specify `tcp_keepalive_intvl` in `tcp(7)`, if applicable. Default: 8 seconds
-fast_open = false # Optional. Enable TCP Fast Open on supported platforms. Default: false
+fast_open = false # Optional. 在支持的平台上启用 TCP Fast Open。默认: false
 
 [client.transport.io_uring_zc_rx] # Optional. Experimental Linux io_uring zero-copy receive path. Also affects `tcp`, `tls`, `noise`, and `websocket`.
 enabled = false # Optional. Try io_uring ZC Rx where possible, falling back to regular TCP reads or splice when unavailable. Default: false
@@ -161,7 +161,7 @@ type = "tcp"
 nodelay = true
 keepalive_secs = 20
 keepalive_interval = 8
-fast_open = false
+fast_open = false # Optional. 在支持的平台上启用 TCP Fast Open。默认: false
 
 [server.transport.io_uring_zc_rx] # Same as the client
 enabled = false
@@ -213,6 +213,12 @@ RUST_LOG=error ./rathole config.toml
 从 v0.4.7 开始, rathole 默认启用 TCP_NODELAY。这能够减少延迟并使交互式应用受益，比如 RDP，Minecraft 服务器。但它会减少一些带宽。
 
 如果带宽更重要，比如网盘类应用，TCP_NODELAY 仍然可以通过配置 `nodelay = false` 关闭。
+
+### TCP Fast Open
+
+`[client.transport.tcp]` 和 `[server.transport.tcp]` 下的 `fast_open = true` 会在平台支持时启用 TCP Fast Open。在 Linux 上，`rathole` 会对出站 TCP 连接设置 `TCP_FASTOPEN_CONNECT`，对监听 socket 设置 `TCP_FASTOPEN`。如果当前平台或内核不支持这些 socket option，会记录 warning 并继续使用普通 TCP。
+
+这个选项只作用于底层 TCP socket，因此也会影响 TLS、Noise 和 WebSocket transport。它不会替代应用层认证；操作系统可能还需要额外的 TCP Fast Open sysctl 或策略设置，才能真正在线路上使用 TFO。
 
 ### `io_uring_zc_rx`
 
