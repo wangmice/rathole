@@ -45,7 +45,10 @@ impl Transport for TcpTransport {
     async fn accept(&self, a: &Self::Acceptor) -> Result<(Self::RawStream, SocketAddr)> {
         let (s, addr) = a.accept().await?;
         self.socket_opts.apply(&s);
-        Ok((MaybeZcRxTcpStream::new(s, &self.zc_rx), addr))
+        Ok((
+            MaybeZcRxTcpStream::new(s, &self.zc_rx, self.cfg.msg_zerocopy),
+            addr,
+        ))
     }
 
     async fn handshake(&self, conn: Self::RawStream) -> Result<Self::Stream> {
@@ -55,7 +58,11 @@ impl Transport for TcpTransport {
     async fn connect(&self, addr: &AddrMaybeCached) -> Result<Self::Stream> {
         let s = tcp_connect_with_proxy(addr, self.cfg.proxy.as_ref(), self.cfg.fast_open).await?;
         self.socket_opts.apply(&s);
-        Ok(MaybeZcRxTcpStream::new(s, &self.zc_rx))
+        Ok(MaybeZcRxTcpStream::new(
+            s,
+            &self.zc_rx,
+            self.cfg.msg_zerocopy,
+        ))
     }
 
     fn forward_tcp(
@@ -74,7 +81,7 @@ async fn forward_tcp(
     idle: Option<Duration>,
 ) -> io::Result<()> {
     let config = data_channel.io_uring_zc_rx_config().clone();
-    let peer = MaybeZcRxTcpStream::new(peer, &config);
+    let peer = MaybeZcRxTcpStream::new(peer, &config, false);
     if data_channel.is_zc_rx_active() || peer.is_zc_rx_active() {
         debug!("Using io_uring ZC Rx TCP forwarding");
         return crate::forward::forward_bidirectional_with_idle_timeout(data_channel, peer, idle)
@@ -94,7 +101,7 @@ async fn forward_tcp(
     idle: Option<Duration>,
 ) -> io::Result<()> {
     let config = data_channel.io_uring_zc_rx_config().clone();
-    let peer = MaybeZcRxTcpStream::new(peer, &config);
+    let peer = MaybeZcRxTcpStream::new(peer, &config, false);
     crate::forward::forward_bidirectional_with_idle_timeout(data_channel, peer, idle).await
 }
 

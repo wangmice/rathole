@@ -5,6 +5,7 @@ mod constants;
 mod forward;
 mod helper;
 mod io_uring_zc_rx;
+mod msg_zerocopy;
 mod multi_map;
 mod protocol;
 mod transport;

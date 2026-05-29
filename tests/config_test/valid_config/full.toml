@@ -7,6 +7,7 @@ type = "tcp" # Optional. Possible values: ["tcp", "tls"]. Default: "tcp"
 
 [client.transport.tcp]
 fast_open = true
+msg_zerocopy = true
 
 [client.transport.io_uring_zc_rx]
 enabled = false
@@ -42,6 +43,7 @@ type = "tcp" # Same as `[client.transport]`
 
 [server.transport.tcp]
 fast_open = true
+msg_zerocopy = true
 
 [server.transport.io_uring_zc_rx]
 enabled = false

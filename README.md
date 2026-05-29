@@ -120,6 +120,7 @@ nodelay = true # Optional. Determine whether to enable TCP_NODELAY, if applicabl
 keepalive_secs = 20 # Optional. Specify `tcp_keepalive_time` in `tcp(7)`, if applicable. Default: 20 seconds
 keepalive_interval = 8 # Optional. Specify `tcp_keepalive_intvl` in `tcp(7)`, if applicable. Default: 8 seconds
 fast_open = false # Optional. Enable TCP Fast Open on supported platforms. Default: false
+msg_zerocopy = false # Optional. Linux MSG_ZEROCOPY send path for TCP writes that must pass through userspace. Default: false
 
 [client.transport.io_uring_zc_rx] # Optional. Experimental Linux io_uring zero-copy receive path. Also affects `tcp`, `tls`, `noise`, and `websocket`.
 enabled = false # Optional. Try io_uring ZC Rx where possible, falling back to regular TCP reads or splice when unavailable. Default: false
@@ -166,6 +167,7 @@ nodelay = true
 keepalive_secs = 20
 keepalive_interval = 8
 fast_open = false
+msg_zerocopy = false
 
 [server.transport.io_uring_zc_rx] # Same as the client
 enabled = false
@@ -221,6 +223,14 @@ If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay =
 `fast_open = true` under `[client.transport.tcp]` and `[server.transport.tcp]` enables TCP Fast Open where the platform supports it. On Linux, `rathole` sets `TCP_FASTOPEN_CONNECT` for outbound TCP connections and `TCP_FASTOPEN` for listeners. Platforms or kernels that do not support these socket options log a warning and continue with regular TCP.
 
 The option only applies to the underlying TCP sockets, so it also affects TLS, Noise, and WebSocket transports. It does not replace application-layer authentication, and the operating system may require its own TCP Fast Open sysctl or policy settings before the feature is actually used on the wire.
+
+### `msg_zerocopy`
+
+`msg_zerocopy = true` under `[client.transport.tcp]` and `[server.transport.tcp]` enables the Linux `SO_ZEROCOPY` / `MSG_ZEROCOPY` send path for TCP writes that still have to pass through userspace, such as TLS, Noise, WebSocket, control-channel writes, and plain TCP streams when `io_uring_zc_rx` prevents the splice path. Plain TCP forwarding keeps using Linux `splice` whenever possible.
+
+Linux reports `MSG_ZEROCOPY` completion through the socket error queue. `rathole` drains `MSG_ERRQUEUE` and keeps the owned send buffers alive until the kernel reports the inclusive completion range in `sock_extended_err.ee_info..=ee_data`. If the platform rejects `SO_ZEROCOPY` or a send hits `ENOBUFS`, `rathole` falls back to regular TCP writes.
+
+This option is useful only for some large-write workloads. The kernel may still copy data internally and report that with `SO_EE_CODE_ZEROCOPY_COPIED`; small writes can be slower due to page pinning and completion overhead.
 
 ### `io_uring_zc_rx`
 

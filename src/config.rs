@@ -171,6 +171,8 @@ pub struct TcpConfig {
     pub keepalive_interval: u64,
     #[serde(default)]
     pub fast_open: bool,
+    #[serde(default)]
+    pub msg_zerocopy: bool,
     pub proxy: Option<Url>,
 }
 
@@ -181,6 +183,7 @@ impl Default for TcpConfig {
             keepalive_secs: default_keepalive_secs(),
             keepalive_interval: default_keepalive_interval(),
             fast_open: false,
+            msg_zerocopy: false,
             proxy: None,
         }
     }
@@ -734,6 +737,7 @@ type = "tcp"
 "#,
         )
         .unwrap();
+        assert!(!parsed.tcp.msg_zerocopy);
         assert!(!parsed.io_uring_zc_rx.enabled);
         assert_eq!(
             parsed.io_uring_zc_rx.ring_entries,
@@ -778,5 +782,19 @@ recv_len = 32768
         invalid.io_uring_zc_rx.area_size = 1024;
         invalid.io_uring_zc_rx.recv_len = 2048;
         assert!(Config::validate_transport_config(&invalid, false).is_err());
+    }
+
+    #[test]
+    fn tcp_msg_zerocopy_config_defaults() {
+        let parsed: TransportConfig = toml::from_str(
+            r#"
+type = "tcp"
+
+[tcp]
+msg_zerocopy = true
+"#,
+        )
+        .unwrap();
+        assert!(parsed.tcp.msg_zerocopy);
     }
 }

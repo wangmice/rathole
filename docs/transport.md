@@ -18,6 +18,24 @@ The setting is shared by all transports that use TCP underneath, including TCP, 
 
 The operating system can still gate TCP Fast Open with sysctl or network policy, so enabling this option in `rathole` only requests TFO from the socket layer.
 
+## MSG_ZEROCOPY
+
+Linux `MSG_ZEROCOPY` can be enabled with `msg_zerocopy = true` in `[client.transport.tcp]` and `[server.transport.tcp]`:
+
+```toml
+[client.transport.tcp]
+msg_zerocopy = true
+
+[server.transport.tcp]
+msg_zerocopy = true
+```
+
+This requests `SO_ZEROCOPY` on the underlying TCP sockets and uses `MSG_ZEROCOPY` for TCP writes that still pass through userspace. That includes TLS, Noise, WebSocket, control-channel writes, and plain TCP streams only when another enabled feature such as io_uring ZC Rx prevents the splice forwarding path. Plain TCP forwarding continues to use Linux `splice` whenever possible.
+
+`MSG_ZEROCOPY` is not fire-and-forget. Linux queues completion notifications on the socket error queue and reports inclusive send-call ranges through `sock_extended_err.ee_info..=ee_data`. `rathole` drains `MSG_ERRQUEUE` in the background and keeps owned send buffers alive until those completions arrive, so user buffers are not reused while the kernel may still reference them.
+
+If `SO_ZEROCOPY` is unavailable, or a zerocopy send fails with `ENOBUFS`, `rathole` falls back to regular TCP writes. The kernel can also complete a request after copying internally and mark it with `SO_EE_CODE_ZEROCOPY_COPIED`, so this option is mainly useful for large-write workloads where page pinning and completion overhead are worth it.
+
 ## io_uring ZC Rx
 
 `rathole` can optionally try Linux io_uring zero-copy receive through `[client.transport.io_uring_zc_rx]` and `[server.transport.io_uring_zc_rx]`. The option is global for the transport block and applies to TCP, TLS, Noise, and WebSocket because all of them sit on top of TCP sockets.
