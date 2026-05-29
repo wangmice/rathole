@@ -1,17 +1,26 @@
 use anyhow::{anyhow, Context, Result};
 use async_http_proxy::{http_connect_tokio, http_connect_tokio_with_basic_auth};
 use backoff::{backoff::Backoff, Notify};
+#[cfg(target_os = "linux")]
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use socket2::{SockRef, TcpKeepalive};
 use std::{future::Future, net::SocketAddr, time::Duration};
+#[cfg(not(target_os = "linux"))]
+use std::sync::Once;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::{
-    net::{lookup_host, TcpStream, ToSocketAddrs, UdpSocket},
+    net::{lookup_host, TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
     sync::broadcast,
 };
-use tracing::trace;
+use tracing::{trace, warn};
 use url::Url;
 
 use crate::transport::AddrMaybeCached;
+
+#[cfg(target_os = "linux")]
+const TCP_LISTEN_BACKLOG: i32 = 1024;
+#[cfg(target_os = "linux")]
+const TCP_FASTOPEN_QUEUE_LEN: i32 = 1024;
 
 // Tokio hesitates to expose this option...So we have to do it on our own :(
 // The good news is that using socket2 it can be easily done, without losing portability.
@@ -141,19 +150,155 @@ pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result
     Ok(s)
 }
 
+pub async fn tcp_bind<A: ToSocketAddrs>(addr: A, fast_open: bool) -> Result<TcpListener> {
+    if !fast_open {
+        return Ok(TcpListener::bind(addr).await?);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        warn_tcp_fast_open_unsupported();
+        Ok(TcpListener::bind(addr).await?)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let addr = to_socket_addr(addr).await?;
+        tcp_bind_socket(addr)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn tcp_bind_socket(addr: SocketAddr) -> Result<TcpListener> {
+    let socket = tcp_socket(addr)?;
+    socket.set_reuse_address(true)?;
+    try_set_tcp_fast_open_listener(&socket);
+
+    socket.bind(&SockAddr::from(addr))?;
+    socket.listen(TCP_LISTEN_BACKLOG)?;
+    socket.set_nonblocking(true)?;
+
+    Ok(TcpListener::from_std(socket.into())?)
+}
+
+async fn tcp_connect<A: ToSocketAddrs>(addr: A, fast_open: bool) -> Result<TcpStream> {
+    if !fast_open {
+        return Ok(TcpStream::connect(addr).await?);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        warn_tcp_fast_open_unsupported();
+        Ok(TcpStream::connect(addr).await?)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let addr = to_socket_addr(addr).await?;
+        tcp_connect_socket(addr).await
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn tcp_connect_socket(addr: SocketAddr) -> Result<TcpStream> {
+    let socket = tcp_socket(addr)?;
+    try_set_tcp_fast_open_connect(&socket);
+
+    socket.set_nonblocking(true)?;
+    match socket.connect(&SockAddr::from(addr)) {
+        Ok(()) => Ok(TcpStream::from_std(socket.into())?),
+        Err(e) if is_connect_in_progress(&e) => {
+            let stream = TcpStream::from_std(socket.into())?;
+            stream.writable().await?;
+            if let Some(e) = stream.take_error()? {
+                return Err(e.into());
+            }
+            Ok(stream)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn tcp_socket(addr: SocketAddr) -> Result<Socket> {
+    let domain = match addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    Ok(Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?)
+}
+
+#[cfg(target_os = "linux")]
+fn is_connect_in_progress(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+
+    e.raw_os_error() == Some(libc::EINPROGRESS)
+}
+
+#[cfg(target_os = "linux")]
+fn try_set_tcp_fast_open_listener(socket: &Socket) {
+    if let Err(e) = set_tcp_fast_open(socket, libc::TCP_FASTOPEN, TCP_FASTOPEN_QUEUE_LEN) {
+        warn!("Failed to enable TCP Fast Open on listener: {}", e);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn try_set_tcp_fast_open_connect(socket: &Socket) {
+    if let Err(e) = set_tcp_fast_open(socket, libc::TCP_FASTOPEN_CONNECT, 1) {
+        warn!("Failed to enable TCP Fast Open on connector: {}", e);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_tcp_fast_open(socket: &Socket, opt: libc::c_int, value: libc::c_int) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let ret = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            opt,
+            &value as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if ret == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn warn_tcp_fast_open_unsupported() {
+    static WARN_ONCE: Once = Once::new();
+    WARN_ONCE.call_once(|| {
+        warn!("TCP Fast Open is not supported by this build; using regular TCP");
+    });
+}
+
 /// Create a TcpStream using a proxy
 /// e.g. socks5://user:pass@127.0.0.1:1080 http://127.0.0.1:8080
 pub async fn tcp_connect_with_proxy(
     addr: &AddrMaybeCached,
     proxy: Option<&Url>,
+    fast_open: bool,
 ) -> Result<TcpStream> {
     if let Some(url) = proxy {
         let addr = &addr.addr;
-        let mut s = TcpStream::connect((
-            url.host_str().expect("proxy url should have host field"),
-            url.port().expect("proxy url should have port field"),
-        ))
+        let mut s = tcp_connect(
+            (
+                url.host_str().expect("proxy url should have host field"),
+                url.port().expect("proxy url should have port field"),
+            ),
+            fast_open,
+        )
         .await?;
+        if fast_open {
+            trace!("TCP Fast Open is applied to the proxy connection");
+        }
 
         let auth = if !url.username().is_empty() || url.password().is_some() {
             Some(async_socks5::Auth {
@@ -188,8 +333,8 @@ pub async fn tcp_connect_with_proxy(
         Ok(s)
     } else {
         Ok(match addr.socket_addr {
-            Some(s) => TcpStream::connect(s).await?,
-            None => TcpStream::connect(&addr.addr).await?,
+            Some(s) => tcp_connect(s, fast_open).await?,
+            None => tcp_connect(addr.addr.as_str(), fast_open).await?,
         })
     }
 }
@@ -227,4 +372,84 @@ where
         .with_context(|| "Failed to write data")?;
     conn.flush().await.with_context(|| "Failed to flush data")?;
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::os::unix::io::{AsRawFd, RawFd};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn getsockopt_int(fd: RawFd, opt: libc::c_int) -> std::io::Result<libc::c_int> {
+        let mut value = 0;
+        let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                opt,
+                &mut value as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if ret == -1 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(value)
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_fast_open_listener_option_is_enabled() -> Result<()> {
+        let listener = tcp_bind("127.0.0.1:0", true).await?;
+        let value = getsockopt_int(listener.as_raw_fd(), libc::TCP_FASTOPEN)?;
+        assert!(value > 0, "TCP_FASTOPEN queue length should be enabled");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_fast_open_connect_option_is_enabled() -> Result<()> {
+        let listener = tcp_bind("127.0.0.1:0", true).await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).await?;
+            Result::<()>::Ok(())
+        });
+
+        let mut stream = tcp_connect(addr, true).await?;
+        let value = getsockopt_int(stream.as_raw_fd(), libc::TCP_FASTOPEN_CONNECT)?;
+        assert_eq!(value, 1, "TCP_FASTOPEN_CONNECT should be enabled");
+        stream.write_all(b"x").await?;
+        server.await??;
+        Ok(())
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn tcp_fast_open_falls_back_to_regular_tcp() -> Result<()> {
+        let listener = tcp_bind("127.0.0.1:0", true).await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).await?;
+            stream.write_all(&byte).await?;
+            Result::<()>::Ok(())
+        });
+
+        let mut stream = tcp_connect(addr, true).await?;
+        stream.write_all(b"x").await?;
+        let mut byte = [0u8; 1];
+        stream.read_exact(&mut byte).await?;
+        assert_eq!(byte, *b"x");
+        server.await??;
+        Ok(())
+    }
 }

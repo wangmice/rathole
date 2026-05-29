@@ -169,6 +169,8 @@ pub struct TcpConfig {
     pub keepalive_secs: u64,
     #[serde(default = "default_keepalive_interval")]
     pub keepalive_interval: u64,
+    #[serde(default)]
+    pub fast_open: bool,
     pub proxy: Option<Url>,
 }
 
@@ -178,6 +180,7 @@ impl Default for TcpConfig {
             nodelay: default_nodelay(),
             keepalive_secs: default_keepalive_secs(),
             keepalive_interval: default_keepalive_interval(),
+            fast_open: false,
             proxy: None,
         }
     }

@@ -5,6 +5,9 @@ default_token = "default_token_if_not_specify" # Optional. The default token of 
 [client.transport]
 type = "tcp" # Optional. Possible values: ["tcp", "tls"]. Default: "tcp"
 
+[client.transport.tcp]
+fast_open = true
+
 [client.transport.tls] # Necessary if `type` is "tls"
 trusted_root = "ca.pem" # Necessary. The certificate of CA that signed the server's certificate
 hostname = "example.com" # Optional. The hostname that the client uses to validate the certificate. If not set, fallback to `client.remote_addr`
@@ -29,6 +32,9 @@ default_token = "default_token_if_not_specify" # Optional
 
 [server.transport]
 type = "tcp" # Same as `[client.transport]`
+
+[server.transport.tcp]
+fast_open = true
 
 [server.transport.tls] # Necessary if `type` is "tls"
 pkcs12 = "identify.pfx" # Necessary. pkcs12 file of server's certificate and private key
