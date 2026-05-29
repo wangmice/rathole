@@ -107,14 +107,50 @@ impl ConfigWatcherHandle {
             .send(ConfigChange::General(Box::new(origin_cfg.clone())))
             .unwrap();
 
-        tokio::spawn(config_watcher(
-            path.to_owned(),
-            shutdown_rx,
-            event_tx,
-            origin_cfg,
-        ));
+        spawn_config_watcher(path.to_owned(), shutdown_rx, event_tx, origin_cfg);
 
         Ok(ConfigWatcherHandle { event_rx })
+    }
+}
+
+fn spawn_config_watcher(
+    path: PathBuf,
+    shutdown_rx: broadcast::Receiver<bool>,
+    event_tx: mpsc::UnboundedSender<ConfigChange>,
+    origin_cfg: Config,
+) {
+    let keepalive_event_tx = event_tx.clone();
+    let shutdown_after_error_rx = shutdown_rx.resubscribe();
+
+    tokio::spawn(async move {
+        let watcher_result = config_watcher(path.clone(), shutdown_rx, event_tx, origin_cfg).await;
+        keep_event_channel_open_after_watcher_error(
+            path,
+            watcher_result,
+            keepalive_event_tx,
+            shutdown_after_error_rx,
+        )
+        .await;
+    });
+}
+
+async fn keep_event_channel_open_after_watcher_error(
+    path: PathBuf,
+    watcher_result: Result<()>,
+    event_tx: mpsc::UnboundedSender<ConfigChange>,
+    mut shutdown_rx: broadcast::Receiver<bool>,
+) {
+    if let Err(e) = watcher_result {
+        error!(
+            "Config watcher for {} exited with error: {:#}. Hot reload disabled.",
+            path.display(),
+            e
+        );
+
+        // Keep the sender alive so the main run loop does not interpret a
+        // watcher setup error as a request to stop the already-started instance.
+        let _event_tx = event_tx;
+        let _ = shutdown_rx.recv().await;
     }
 }
 
@@ -265,6 +301,7 @@ mod test {
     use crate::config::ServerConfig;
 
     use super::*;
+    use tokio::time::{timeout, Duration};
 
     // macro to create map or set literal
     macro_rules! collection {
@@ -424,5 +461,27 @@ mod test {
             ),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn watcher_error_keeps_event_channel_open_until_shutdown() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+        let task = tokio::spawn(keep_event_channel_open_after_watcher_error(
+            PathBuf::from("config/test.toml"),
+            Err(anyhow::anyhow!("permission denied")),
+            event_tx,
+            shutdown_rx,
+        ));
+
+        assert!(timeout(Duration::from_millis(50), event_rx.recv())
+            .await
+            .is_err());
+
+        let _ = shutdown_tx.send(true);
+        task.await.unwrap();
+
+        assert_eq!(event_rx.recv().await, None);
     }
 }
