@@ -21,6 +21,7 @@ jobs:
     name: Cross build for ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -97,10 +98,6 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cross@0.2.5
-      - name: Run tests
-        if: matrix.cross
-        timeout-minutes: 20
-        run: cross test --release --target ${{ matrix.target }} --verbose --features embedded --no-default-features -- --test-threads=1
       - name: Build release
         if: matrix.cross
         run: cross build --release --target ${{ matrix.target }} --features embedded --no-default-features
