@@ -5,8 +5,8 @@ use crate::helper::{retry_notify_with_deadline, write_and_flush};
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
-    self, read_ack, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello, UdpTraffic,
-    HASH_WIDTH_IN_BYTES,
+    self, read_ack, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello,
+    UdpTraffic, HASH_WIDTH_IN_BYTES,
 };
 use crate::transport::{SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
@@ -46,7 +46,10 @@ const TCP_POOL_HEARTBEAT_TIMEOUT: u64 = 5;
 // problem and stays at warn.
 fn log_forwarder_outcome(kind: &'static str, e: &io::Error) {
     if crate::forward::is_post_half_close_idle_timeout(e) {
-        debug!("Forwarder ({}) reaped by post-half-close idle timeout", kind);
+        debug!(
+            "Forwarder ({}) reaped by post-half-close idle timeout",
+            kind
+        );
     } else {
         warn!("Forwarder ({}) ended with error: {}", kind, e);
     }
@@ -453,6 +456,7 @@ where
 
         // Store data channel creation requests
         let (data_ch_req_tx, data_ch_req_rx) = mpsc::unbounded_channel();
+        let data_ch_tx_for_pool = data_ch_tx.clone();
 
         // Cache some data channels for later use
         let pool_size = match service.service_type {
@@ -474,6 +478,7 @@ where
                     if let Err(e) = run_tcp_connection_pool::<T>(
                         bind_addr,
                         post_half_close_idle_timeout,
+                        data_ch_tx_for_pool,
                         data_ch_rx,
                         data_ch_req_tx,
                         shutdown_rx_clone,
@@ -521,7 +526,12 @@ where
                 }
 
                 if let Some(control_channels) = control_channels.upgrade() {
-                    if control_channels.write().await.remove2(&session_key).is_some() {
+                    if control_channels
+                        .write()
+                        .await
+                        .remove2(&session_key)
+                        .is_some()
+                    {
                         debug!(
                             service = %service_name,
                             digest = %hex::encode(service_digest),
@@ -568,10 +578,12 @@ impl<T: Transport> ControlChannel<T> {
                 val = self.data_ch_req_rx.recv() => {
                     match val {
                         Some(_) => {
+                            debug!("Sending {:?}", ControlChannelCmd::CreateDataChannel);
                             if let Err(e) = self.write_and_flush(&create_ch_cmd).await {
                                 error!("{:#}", e);
                                 break;
                             }
+                            debug!("Sent {:?}", ControlChannelCmd::CreateDataChannel);
                         }
                         None => {
                             break;
@@ -579,10 +591,12 @@ impl<T: Transport> ControlChannel<T> {
                     }
                 },
                 _ = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
+                            debug!("Sending {:?}", ControlChannelCmd::HeartBeat);
                             if let Err(e) = self.write_and_flush(&heartbeat).await {
                                 error!("{:#}", e);
                                 break;
                             }
+                            debug!("Sent {:?}", ControlChannelCmd::HeartBeat);
                 }
                 // Wait for the shutdown signal
                 _ = self.shutdown_rx.recv() => {
@@ -680,35 +694,79 @@ struct PooledTcpDataChannel<S> {
     last_checked: time::Instant,
 }
 
-async fn check_tcp_pool_channel<S>(mut conn: S, heartbeat_cmd: Vec<u8>) -> Result<S>
+async fn check_tcp_pool_channel<S>(conn: S, heartbeat_cmd: Vec<u8>) -> Result<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    write_and_flush(&mut conn, &heartbeat_cmd).await?;
-    match time::timeout(
+    check_tcp_pool_channel_with_timeout(
+        conn,
+        heartbeat_cmd,
         Duration::from_secs(TCP_POOL_HEARTBEAT_TIMEOUT),
-        read_ack(&mut conn),
     )
     .await
-    {
-        Ok(Ok(Ack::Ok)) => Ok(conn),
-        Ok(Ok(v)) => Err(anyhow!("Unexpected data channel heartbeat response: {}", v)),
-        Ok(Err(e)) => Err(e),
+}
+
+async fn check_tcp_pool_channel_with_timeout<S>(
+    mut conn: S,
+    heartbeat_cmd: Vec<u8>,
+    timeout: Duration,
+) -> Result<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let heartbeat = async move {
+        debug!("Checking idle TCP data channel");
+        write_and_flush(&mut conn, &heartbeat_cmd).await?;
+        match read_ack(&mut conn).await? {
+            Ack::Ok => {
+                debug!("Idle TCP data channel heartbeat succeeded");
+                Ok(conn)
+            }
+            v => Err(anyhow!("Unexpected data channel heartbeat response: {}", v)),
+        }
+    };
+
+    match time::timeout(timeout, heartbeat).await {
+        Ok(result) => result,
         Err(_) => Err(anyhow!("Data channel heartbeat timed out")),
     }
 }
 
 async fn refresh_tcp_pool<S>(
     pool: &mut VecDeque<PooledTcpDataChannel<S>>,
+    data_ch_tx: mpsc::Sender<S>,
     data_ch_req_tx: &mpsc::UnboundedSender<bool>,
     heartbeat_cmd: &[u8],
 ) where
     S: 'static + AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let mut pending = Vec::new();
+    refresh_tcp_pool_with_timeout(
+        pool,
+        data_ch_tx,
+        data_ch_req_tx,
+        heartbeat_cmd,
+        Duration::from_secs(TCP_POOL_HEARTBEAT_TIMEOUT),
+    )
+    .await;
+}
+
+async fn refresh_tcp_pool_with_timeout<S>(
+    pool: &mut VecDeque<PooledTcpDataChannel<S>>,
+    data_ch_tx: mpsc::Sender<S>,
+    data_ch_req_tx: &mpsc::UnboundedSender<bool>,
+    heartbeat_cmd: &[u8],
+    heartbeat_timeout: Duration,
+) where
+    S: 'static + AsyncRead + AsyncWrite + Unpin + Send,
+{
     let now = time::Instant::now();
 
-    while let Some(pooled) = pool.pop_front() {
+    let pool_len = pool.len();
+    for _ in 0..pool_len {
+        let Some(pooled) = pool.pop_front() else {
+            break;
+        };
+
         if now.duration_since(pooled.last_checked)
             < Duration::from_secs(TCP_POOL_HEARTBEAT_INTERVAL)
         {
@@ -716,27 +774,24 @@ async fn refresh_tcp_pool<S>(
             continue;
         }
 
-        pending.push(tokio::spawn(check_tcp_pool_channel(
-            pooled.conn,
-            heartbeat_cmd.to_vec(),
-        )));
-    }
-
-    for task in pending {
-        match task.await {
-            Ok(Ok(conn)) => pool.push_back(PooledTcpDataChannel {
-                conn,
-                last_checked: time::Instant::now(),
-            }),
-            Ok(Err(e)) => {
-                debug!("Dropping unhealthy idle TCP data channel: {:#}", e);
-                let _ = data_ch_req_tx.send(true);
+        let data_ch_tx = data_ch_tx.clone();
+        let data_ch_req_tx = data_ch_req_tx.clone();
+        let heartbeat_cmd = heartbeat_cmd.to_vec();
+        tokio::spawn(async move {
+            match check_tcp_pool_channel_with_timeout(pooled.conn, heartbeat_cmd, heartbeat_timeout)
+                .await
+            {
+                Ok(conn) => {
+                    if data_ch_tx.send(conn).await.is_err() {
+                        debug!("Dropping healthy TCP data channel after pool shutdown");
+                    }
+                }
+                Err(e) => {
+                    debug!("Dropping unhealthy idle TCP data channel: {:#}", e);
+                    let _ = data_ch_req_tx.send(true);
+                }
             }
-            Err(e) => {
-                warn!("TCP data channel heartbeat task failed: {}", e);
-                let _ = data_ch_req_tx.send(true);
-            }
-        }
+        });
     }
 }
 
@@ -774,6 +829,7 @@ where
 async fn run_tcp_connection_pool<T: 'static + Transport>(
     bind_addr: String,
     post_half_close_idle_timeout: Option<Duration>,
+    data_ch_tx: mpsc::Sender<T::Stream>,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     shutdown_rx: broadcast::Receiver<bool>,
@@ -782,8 +838,7 @@ async fn run_tcp_connection_pool<T: 'static + Transport>(
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
     let heartbeat_cmd = bincode::serialize(&DataChannelCmd::HeartBeat).unwrap();
     let mut pool: VecDeque<PooledTcpDataChannel<T::Stream>> = VecDeque::new();
-    let mut heartbeat_interval =
-        time::interval(Duration::from_secs(TCP_POOL_HEARTBEAT_INTERVAL));
+    let mut heartbeat_interval = time::interval(Duration::from_secs(TCP_POOL_HEARTBEAT_INTERVAL));
 
     loop {
         tokio::select! {
@@ -841,7 +896,13 @@ async fn run_tcp_connection_pool<T: 'static + Transport>(
                 }
             },
             _ = heartbeat_interval.tick() => {
-                refresh_tcp_pool(&mut pool, &data_ch_req_tx, &heartbeat_cmd).await;
+                refresh_tcp_pool(
+                    &mut pool,
+                    data_ch_tx.clone(),
+                    &data_ch_req_tx,
+                    &heartbeat_cmd,
+                )
+                .await;
             }
         }
     }
@@ -910,7 +971,41 @@ async fn run_udp_connection_pool<T: Transport>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use tokio::io::duplex;
+    use tokio::io::ReadBuf;
+
+    #[derive(Debug)]
+    struct PendingHeartbeatWrite;
+
+    impl AsyncRead for PendingHeartbeatWrite {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for PendingHeartbeatWrite {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[tokio::test]
     async fn tcp_pool_heartbeat_accepts_ack() -> Result<()> {
@@ -919,15 +1014,14 @@ mod tests {
 
         let client = tokio::spawn(async move {
             assert!(matches!(
-                crate::protocol::read_data_cmd(&mut client_side).await.unwrap(),
+                crate::protocol::read_data_cmd(&mut client_side)
+                    .await
+                    .unwrap(),
                 DataChannelCmd::HeartBeat
             ));
-            write_and_flush(
-                &mut client_side,
-                &bincode::serialize(&Ack::Ok).unwrap(),
-            )
-            .await
-            .unwrap();
+            write_and_flush(&mut client_side, &bincode::serialize(&Ack::Ok).unwrap())
+                .await
+                .unwrap();
         });
 
         let _server_side = check_tcp_pool_channel(server_side, heartbeat_cmd).await?;
@@ -953,14 +1047,10 @@ mod tests {
         });
 
         let heartbeat_cmd = bincode::serialize(&DataChannelCmd::HeartBeat).unwrap();
-        let mut selected = next_tcp_pool_channel(
-            &mut pool,
-            &mut data_ch_rx,
-            &data_ch_req_tx,
-            &heartbeat_cmd,
-        )
-        .await
-        .expect("fresh data channel should replace stale pool entry");
+        let mut selected =
+            next_tcp_pool_channel(&mut pool, &mut data_ch_rx, &data_ch_req_tx, &heartbeat_cmd)
+                .await
+                .expect("fresh data channel should replace stale pool entry");
 
         assert!(data_ch_req_rx.try_recv().is_ok());
 
@@ -973,6 +1063,90 @@ mod tests {
             crate::protocol::read_data_cmd(&mut fresh_client_side).await?,
             DataChannelCmd::StartForwardTcp
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_heartbeat_times_out_when_write_stalls() -> Result<()> {
+        let err = check_tcp_pool_channel_with_timeout(
+            PendingHeartbeatWrite,
+            bincode::serialize(&DataChannelCmd::HeartBeat).unwrap(),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected heartbeat error: {err:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_refresh_does_not_block_on_stalled_heartbeat() -> Result<()> {
+        let (data_ch_req_tx, mut data_ch_req_rx) = mpsc::unbounded_channel();
+        let (data_ch_tx, mut data_ch_rx) = mpsc::channel(1);
+        let mut pool = VecDeque::new();
+        pool.push_back(PooledTcpDataChannel {
+            conn: PendingHeartbeatWrite,
+            last_checked: time::Instant::now()
+                - Duration::from_secs(TCP_POOL_HEARTBEAT_INTERVAL + 1),
+        });
+
+        time::timeout(
+            Duration::from_millis(50),
+            refresh_tcp_pool_with_timeout(
+                &mut pool,
+                data_ch_tx,
+                &data_ch_req_tx,
+                &bincode::serialize(&DataChannelCmd::HeartBeat).unwrap(),
+                Duration::from_millis(10),
+            ),
+        )
+        .await?;
+
+        assert!(pool.is_empty());
+        assert!(data_ch_rx.try_recv().is_err());
+        assert!(matches!(
+            time::timeout(Duration::from_secs(1), data_ch_req_rx.recv()).await?,
+            Some(true)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_refresh_scans_fresh_channels_once() -> Result<()> {
+        let (data_ch_req_tx, mut data_ch_req_rx) = mpsc::unbounded_channel();
+        let (data_ch_tx, mut data_ch_rx) = mpsc::channel(1);
+        let mut pool = VecDeque::new();
+        let (server_side_1, _client_side_1) = duplex(64);
+        let (server_side_2, _client_side_2) = duplex(64);
+
+        pool.push_back(PooledTcpDataChannel {
+            conn: server_side_1,
+            last_checked: time::Instant::now(),
+        });
+        pool.push_back(PooledTcpDataChannel {
+            conn: server_side_2,
+            last_checked: time::Instant::now(),
+        });
+
+        time::timeout(
+            Duration::from_millis(50),
+            refresh_tcp_pool_with_timeout(
+                &mut pool,
+                data_ch_tx,
+                &data_ch_req_tx,
+                &bincode::serialize(&DataChannelCmd::HeartBeat).unwrap(),
+                Duration::from_millis(10),
+            ),
+        )
+        .await?;
+
+        assert_eq!(pool.len(), 2);
+        assert!(data_ch_req_rx.try_recv().is_err());
+        assert!(data_ch_rx.try_recv().is_err());
         Ok(())
     }
 }

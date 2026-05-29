@@ -86,7 +86,10 @@ type Nonce = protocol::Digest;
 // problem and stays at warn.
 fn log_forwarder_outcome(kind: &'static str, e: &io::Error) {
     if crate::forward::is_post_half_close_idle_timeout(e) {
-        debug!("Forwarder ({}) reaped by post-half-close idle timeout", kind);
+        debug!(
+            "Forwarder ({}) reaped by post-half-close idle timeout",
+            kind
+        );
     } else {
         warn!("Forwarder ({}) ended with error: {}", kind, e);
     }
@@ -250,7 +253,9 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6)
                 .await?;
         }
-        DataChannelCmd::HeartBeat => unreachable!("heartbeat commands are handled before forwarding"),
+        DataChannelCmd::HeartBeat => {
+            unreachable!("heartbeat commands are handled before forwarding")
+        }
     }
     Ok(())
 }
@@ -262,9 +267,11 @@ where
     loop {
         match read_data_cmd(conn).await? {
             DataChannelCmd::HeartBeat => {
+                debug!("Received data channel heartbeat");
                 conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
                     .await?;
                 conn.flush().await?;
+                debug!("Acked data channel heartbeat");
             }
             cmd => return Ok(cmd),
         }
@@ -295,7 +302,11 @@ async fn run_data_channel_for_tcp<T: Transport>(
 type UdpPortMap = Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
 
 #[instrument(skip(conn))]
-async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &str, prefer_ipv6: bool) -> Result<()> {
+async fn run_data_channel_for_udp<T: Transport>(
+    conn: T::Stream,
+    local_addr: &str,
+    prefer_ipv6: bool,
+) -> Result<()> {
     debug!("New data channel starts forwarding");
 
     let port_map: UdpPortMap = Arc::new(RwLock::new(HashMap::new()));
@@ -625,10 +636,7 @@ mod tests {
             .await?;
         server_side.flush().await?;
 
-        assert!(matches!(
-            client.await??,
-            DataChannelCmd::StartForwardTcp
-        ));
+        assert!(matches!(client.await??, DataChannelCmd::StartForwardTcp));
         Ok(())
     }
 }
