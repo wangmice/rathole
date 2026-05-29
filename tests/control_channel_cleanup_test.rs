@@ -20,7 +20,7 @@ const SHUTDOWN_SERVER_ADDR: &str = "127.0.0.1:3401";
 const SHUTDOWN_SERVICE_ADDR: &str = "127.0.0.1:3402";
 const SHUTDOWN_SERVICE_NAME: &str = "shutdown_cleanup";
 const TOKEN: &str = "default_token_if_not_specify";
-const CURRENT_PROTO_VERSION: u8 = 1;
+const CURRENT_PROTO_VERSION: u8 = 2;
 
 type Digest = [u8; 32];
 

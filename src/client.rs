@@ -16,7 +16,7 @@ use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::time::{self, Duration, Instant};
@@ -232,7 +232,7 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
     let mut conn = do_data_channel_handshake(args.clone()).await?;
 
     // Forward
-    match read_data_cmd(&mut conn).await? {
+    match read_forward_start_cmd(&mut conn).await? {
         DataChannelCmd::StartForwardTcp => {
             if args.service.service_type != ServiceType::Tcp {
                 bail!("Expect TCP traffic. Please check the configuration.")
@@ -251,8 +251,25 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6)
                 .await?;
         }
+        DataChannelCmd::HeartBeat => unreachable!("heartbeat commands are handled before forwarding"),
     }
     Ok(())
+}
+
+async fn read_forward_start_cmd<T>(conn: &mut T) -> Result<DataChannelCmd>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        match read_data_cmd(conn).await? {
+            DataChannelCmd::HeartBeat => {
+                conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
+                    .await?;
+                conn.flush().await?;
+            }
+            cmd => return Ok(cmd),
+        }
+    }
 }
 
 // Two-phase bidirectional forwarding for TCP. See `crate::forward`.
@@ -586,5 +603,35 @@ impl ControlChannelHandle {
     fn shutdown(self) {
         // A send failure shows that the actor has already shutdown.
         let _ = self.shutdown_tx.send(0u8);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn data_channel_heartbeat_is_acked_before_forwarding() -> Result<()> {
+        let (mut client_side, mut server_side) = duplex(64);
+
+        let client = tokio::spawn(async move { read_forward_start_cmd(&mut client_side).await });
+
+        server_side
+            .write_all(&bincode::serialize(&DataChannelCmd::HeartBeat).unwrap())
+            .await?;
+        server_side.flush().await?;
+        assert!(matches!(read_ack(&mut server_side).await?, Ack::Ok));
+
+        server_side
+            .write_all(&bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap())
+            .await?;
+        server_side.flush().await?;
+
+        assert!(matches!(
+            client.await??,
+            DataChannelCmd::StartForwardTcp
+        ));
+        Ok(())
     }
 }
