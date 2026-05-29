@@ -22,9 +22,8 @@ pub fn try_set_tcp_keepalive(
     keepalive_interval: Duration,
 ) -> Result<()> {
     let s = SockRef::from(conn);
-    let keepalive = TcpKeepalive::new()
-        .with_time(keepalive_duration)
-        .with_interval(keepalive_interval);
+    let keepalive = TcpKeepalive::new().with_time(keepalive_duration);
+    let keepalive = tcp_keepalive_with_interval(keepalive, keepalive_interval);
 
     trace!(
         "Set TCP keepalive {:?} {:?}",
@@ -33,6 +32,42 @@ pub fn try_set_tcp_keepalive(
     );
 
     Ok(s.set_tcp_keepalive(&keepalive)?)
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "illumos",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_vendor = "apple",
+    windows,
+))]
+fn tcp_keepalive_with_interval(
+    keepalive: TcpKeepalive,
+    keepalive_interval: Duration,
+) -> TcpKeepalive {
+    keepalive.with_interval(keepalive_interval)
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "illumos",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_vendor = "apple",
+    windows,
+)))]
+fn tcp_keepalive_with_interval(
+    keepalive: TcpKeepalive,
+    _keepalive_interval: Duration,
+) -> TcpKeepalive {
+    keepalive
 }
 
 #[allow(dead_code)]
