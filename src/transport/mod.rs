@@ -62,7 +62,10 @@ pub trait Transport: Debug + Send + Sync {
     async fn bind<T: ToSocketAddrs + Send + Sync>(&self, addr: T) -> Result<Self::Acceptor>;
     /// accept must be cancel safe
     async fn accept(&self, a: &Self::Acceptor) -> Result<(Self::RawStream, SocketAddr)>;
-    async fn handshake(&self, conn: Self::RawStream) -> Result<Self::Stream>;
+    fn handshake(
+        &self,
+        conn: Self::RawStream,
+    ) -> impl Future<Output = Result<Self::Stream>> + Send;
     fn connect(&self, addr: &AddrMaybeCached) -> impl Future<Output = Result<Self::Stream>> + Send;
 }
 

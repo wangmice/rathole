@@ -192,28 +192,45 @@ impl<T: 'static + Transport> Server<T> {
                         Ok((conn, addr)) => {
                             backoff.reset();
 
-                            // Do transport handshake with a timeout
-                            match time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), self.transport.handshake(conn)).await {
-                                Ok(conn) => {
-                                    match conn.with_context(|| "Failed to do transport handshake") {
+                            let transport = self.transport.clone();
+                            let services = self.services.clone();
+                            let control_channels = self.control_channels.clone();
+                            let server_config = self.config.clone();
+
+                            tokio::spawn(async move {
+                                // Do transport handshake with a timeout. Keep this out of the
+                                // accept loop so slow or bogus handshakes cannot block other
+                                // clients from connecting.
+                                match time::timeout(
+                                    Duration::from_secs(HANDSHAKE_TIMEOUT),
+                                    transport.handshake(conn),
+                                )
+                                .await
+                                {
+                                    Ok(conn) => match conn
+                                        .with_context(|| "Failed to do transport handshake")
+                                    {
                                         Ok(conn) => {
-                                            let services = self.services.clone();
-                                            let control_channels = self.control_channels.clone();
-                                            let server_config = self.config.clone();
-                                            tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config).await {
-                                                    error!("{:#}", err);
-                                                }
-                                            }.instrument(info_span!("connection", %addr)));
-                                        }, Err(e) => {
+                                            if let Err(err) = handle_connection(
+                                                conn,
+                                                services,
+                                                control_channels,
+                                                server_config,
+                                            )
+                                            .await
+                                            {
+                                                error!("{:#}", err);
+                                            }
+                                        }
+                                        Err(e) => {
                                             error!("{:#}", e);
                                         }
+                                    },
+                                    Err(e) => {
+                                        error!("Transport handshake timeout: {}", e);
                                     }
-                                },
-                                Err(e) => {
-                                    error!("Transport handshake timeout: {}", e);
                                 }
-                            }
+                            }.instrument(info_span!("connection", %addr)));
                         }
                     }
                 },
