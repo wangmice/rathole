@@ -186,6 +186,44 @@ impl Default for TcpConfig {
     }
 }
 
+fn default_io_uring_zc_rx_ring_entries() -> u32 {
+    4096
+}
+
+fn default_io_uring_zc_rx_area_size() -> u64 {
+    16 * 1024 * 1024
+}
+
+fn default_io_uring_zc_rx_recv_len() -> u32 {
+    64 * 1024
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct IoUringZcRxConfig {
+    pub enabled: bool,
+    pub interface: Option<String>,
+    pub interface_index: Option<u32>,
+    pub rx_queue: u32,
+    pub ring_entries: u32,
+    pub area_size: u64,
+    pub recv_len: u32,
+}
+
+impl Default for IoUringZcRxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interface: None,
+            interface_index: None,
+            rx_queue: 0,
+            ring_entries: default_io_uring_zc_rx_ring_entries(),
+            area_size: default_io_uring_zc_rx_area_size(),
+            recv_len: default_io_uring_zc_rx_recv_len(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct TransportConfig {
@@ -193,6 +231,8 @@ pub struct TransportConfig {
     pub transport_type: TransportType,
     #[serde(default)]
     pub tcp: TcpConfig,
+    #[serde(default)]
+    pub io_uring_zc_rx: IoUringZcRxConfig,
     pub tls: Option<TlsConfig>,
     pub noise: Option<NoiseConfig>,
     pub websocket: Option<WebsocketConfig>,
@@ -376,6 +416,34 @@ impl Config {
     }
 
     fn validate_transport_config(config: &TransportConfig, is_server: bool) -> Result<()> {
+        let zc_rx = &config.io_uring_zc_rx;
+        if zc_rx.enabled {
+            if zc_rx.interface.is_some() && zc_rx.interface_index.is_some() {
+                bail!("`io_uring_zc_rx.interface` and `io_uring_zc_rx.interface_index` are mutually exclusive");
+            }
+            if zc_rx.interface.as_ref().is_some_and(|s| s.is_empty()) {
+                bail!("`io_uring_zc_rx.interface` must not be empty");
+            }
+            if zc_rx.interface_index == Some(0) {
+                bail!("`io_uring_zc_rx.interface_index` must be non-zero");
+            }
+            if zc_rx.ring_entries == 0 || !zc_rx.ring_entries.is_power_of_two() {
+                bail!("`io_uring_zc_rx.ring_entries` must be a non-zero power of two");
+            }
+            if zc_rx.area_size == 0 {
+                bail!("`io_uring_zc_rx.area_size` must be non-zero");
+            }
+            if usize::try_from(zc_rx.area_size).is_err() {
+                bail!("`io_uring_zc_rx.area_size` does not fit in usize");
+            }
+            if zc_rx.recv_len == 0 {
+                bail!("`io_uring_zc_rx.recv_len` must be non-zero");
+            }
+            if zc_rx.area_size < u64::from(zc_rx.recv_len) {
+                bail!("`io_uring_zc_rx.area_size` must be at least `io_uring_zc_rx.recv_len`");
+            }
+        }
+
         config
             .tcp
             .proxy
@@ -656,5 +724,59 @@ post_half_close_idle_timeout = "later"
 "#,
         );
         assert!(err.is_err(), "unknown string must be rejected");
+    }
+
+    #[test]
+    fn io_uring_zc_rx_config_defaults_and_validation() {
+        let parsed: TransportConfig = toml::from_str(
+            r#"
+type = "tcp"
+"#,
+        )
+        .unwrap();
+        assert!(!parsed.io_uring_zc_rx.enabled);
+        assert_eq!(
+            parsed.io_uring_zc_rx.ring_entries,
+            default_io_uring_zc_rx_ring_entries()
+        );
+        assert_eq!(
+            parsed.io_uring_zc_rx.area_size,
+            default_io_uring_zc_rx_area_size()
+        );
+        assert_eq!(
+            parsed.io_uring_zc_rx.recv_len,
+            default_io_uring_zc_rx_recv_len()
+        );
+
+        let parsed: TransportConfig = toml::from_str(
+            r#"
+type = "tcp"
+
+[io_uring_zc_rx]
+enabled = true
+interface = "eth0"
+rx_queue = 1
+ring_entries = 1024
+area_size = 2097152
+recv_len = 32768
+"#,
+        )
+        .unwrap();
+        assert!(Config::validate_transport_config(&parsed, false).is_ok());
+        assert_eq!(parsed.io_uring_zc_rx.interface.as_deref(), Some("eth0"));
+        assert_eq!(parsed.io_uring_zc_rx.rx_queue, 1);
+
+        let mut invalid = parsed.clone();
+        invalid.io_uring_zc_rx.ring_entries = 1000;
+        assert!(Config::validate_transport_config(&invalid, false).is_err());
+
+        let mut invalid = parsed.clone();
+        invalid.io_uring_zc_rx.interface_index = Some(2);
+        assert!(Config::validate_transport_config(&invalid, false).is_err());
+
+        let mut invalid = parsed;
+        invalid.io_uring_zc_rx.area_size = 1024;
+        invalid.io_uring_zc_rx.recv_len = 2048;
+        assert!(Config::validate_transport_config(&invalid, false).is_err());
     }
 }

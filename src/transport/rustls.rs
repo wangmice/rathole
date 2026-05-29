@@ -1,5 +1,6 @@
 use crate::config::{TlsConfig, TransportConfig};
 use crate::helper::host_port_pair;
+use crate::io_uring_zc_rx::MaybeZcRxTcpStream;
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use std::fmt::Debug;
 use std::fs;
@@ -82,8 +83,8 @@ fn load_client_config(config: &TlsConfig) -> Result<Option<ClientConfig>> {
 
 impl Transport for TlsTransport {
     type Acceptor = TcpListener;
-    type RawStream = TcpStream;
-    type Stream = TlsStream<TcpStream>;
+    type RawStream = MaybeZcRxTcpStream;
+    type Stream = TlsStream<MaybeZcRxTcpStream>;
 
     fn new(config: &TransportConfig) -> Result<Self> {
         let tcp = TcpTransport::new(config)?;
@@ -108,7 +109,7 @@ impl Transport for TlsTransport {
     }
 
     fn hint(conn: &Self::Stream, opt: SocketOpts) {
-        opt.apply(conn.get_ref().0);
+        opt.apply(conn.get_ref().0.tcp_stream());
     }
 
     async fn bind<A: ToSocketAddrs + Send + Sync>(&self, addr: A) -> Result<Self::Acceptor> {
@@ -149,6 +150,6 @@ impl Transport for TlsTransport {
     }
 }
 
-pub(crate) fn get_tcpstream(s: &TlsStream<TcpStream>) -> &TcpStream {
-    &s.get_ref().0
+pub(crate) fn get_tcpstream(s: &TlsStream<MaybeZcRxTcpStream>) -> &TcpStream {
+    s.get_ref().0.tcp_stream()
 }

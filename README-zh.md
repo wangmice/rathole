@@ -116,6 +116,16 @@ proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. The proxy used to conn
 nodelay = true # Optional. Override the `client.transport.nodelay` per service
 keepalive_secs = 20 # Optional. Specify `tcp_keepalive_time` in `tcp(7)`, if applicable. Default: 20 seconds
 keepalive_interval = 8 # Optional. Specify `tcp_keepalive_intvl` in `tcp(7)`, if applicable. Default: 8 seconds
+fast_open = false # Optional. Enable TCP Fast Open on supported platforms. Default: false
+
+[client.transport.io_uring_zc_rx] # Optional. Experimental Linux io_uring zero-copy receive path. Also affects `tcp`, `tls`, `noise`, and `websocket`.
+enabled = false # Optional. Try io_uring ZC Rx where possible, falling back to regular TCP reads or splice when unavailable. Default: false
+interface = "eth0" # Optional. Network interface name. If omitted, rathole tries to infer it from the socket's local address.
+# interface_index = 2 # Optional alternative to `interface`.
+rx_queue = 0 # Optional. RX queue to register. Default: 0
+ring_entries = 4096 # Optional. Must be a non-zero power of two. Default: 4096
+area_size = 16777216 # Optional. Size of the ZC Rx area in bytes. Default: 16 MiB
+recv_len = 65536 # Optional. Maximum bytes requested per receive completion. Default: 64 KiB
 
 [client.transport.tls] # Necessary if `type` is "tls"
 trusted_root = "ca.pem" # Necessary. The certificate of CA that signed the server's certificate
@@ -151,6 +161,16 @@ type = "tcp"
 nodelay = true
 keepalive_secs = 20
 keepalive_interval = 8
+fast_open = false
+
+[server.transport.io_uring_zc_rx] # Same as the client
+enabled = false
+interface = "eth0"
+# interface_index = 2
+rx_queue = 0
+ring_entries = 4096
+area_size = 16777216
+recv_len = 65536
 
 [server.transport.tls] # Necessary if `type` is "tls"
 pkcs12 = "identify.pfx" # Necessary. pkcs12 file of server's certificate and private key
@@ -193,6 +213,12 @@ RUST_LOG=error ./rathole config.toml
 从 v0.4.7 开始, rathole 默认启用 TCP_NODELAY。这能够减少延迟并使交互式应用受益，比如 RDP，Minecraft 服务器。但它会减少一些带宽。
 
 如果带宽更重要，比如网盘类应用，TCP_NODELAY 仍然可以通过配置 `nodelay = false` 关闭。
+
+### `io_uring_zc_rx`
+
+`[client.transport.io_uring_zc_rx]` 和 `[server.transport.io_uring_zc_rx]` 会启用实验性的 Linux 接收侧 zero-copy 路径，底层使用 `IORING_OP_RECV_ZC`。启用后，`rathole` 会尽可能为 TCP 流注册 io_uring ZC Rx；如果内核、网卡、RX 队列或当前平台不支持，会回退到现有 TCP 路径。明文 TCP 转发在 ZC Rx 不可用时仍会使用 Linux `splice`。
+
+这个选项需要支持 io_uring ZC Rx 的 Linux 内核，以及满足内核要求的网卡/驱动配置，包括 header/data split、flow steering 和 RSS。`interface` 或 `interface_index` 与 `rx_queue` 用于指定要注册的 RX 队列；如果没有指定接口，`rathole` 会尝试根据 socket 的本地地址推断接口。
 
 ## Benchmark
 

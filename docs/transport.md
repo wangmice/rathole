@@ -2,6 +2,24 @@
 
 By default, `rathole` forwards traffic as it is. Different options can be enabled to secure the traffic.
 
+## io_uring ZC Rx
+
+`rathole` can optionally try Linux io_uring zero-copy receive through `[client.transport.io_uring_zc_rx]` and `[server.transport.io_uring_zc_rx]`. The option is global for the transport block and applies to TCP, TLS, Noise, and WebSocket because all of them sit on top of TCP sockets.
+
+```toml
+[client.transport.io_uring_zc_rx]
+enabled = true
+interface = "eth0"
+rx_queue = 0
+ring_entries = 4096
+area_size = 16777216
+recv_len = 65536
+```
+
+The implementation probes and registers `IORING_OP_RECV_ZC` per TCP stream. If the platform is not Linux, the kernel does not support the opcode, or the selected NIC/RX queue cannot be registered, `rathole` logs the fallback and uses the normal TCP read path. Plain TCP forwarding keeps using Linux `splice` when ZC Rx is unavailable.
+
+ZC Rx is not enabled by the kernel alone. The selected NIC and driver must also satisfy the kernel requirements, including header/data split, flow steering, and RSS, and those features may need out-of-band setup with tools such as `ethtool`. `interface_index` can be used instead of `interface`; if neither is set, `rathole` tries to infer the interface from the socket's local address.
+
 ## TLS
 
 Checkout the [example](../examples/tls)

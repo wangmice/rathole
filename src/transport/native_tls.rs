@@ -1,5 +1,6 @@
 use crate::config::{TlsConfig, TransportConfig};
 use crate::helper::host_port_pair;
+use crate::io_uring_zc_rx::MaybeZcRxTcpStream;
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, Context, Result};
 use std::fs;
@@ -19,8 +20,8 @@ pub struct TlsTransport {
 
 impl Transport for TlsTransport {
     type Acceptor = TcpListener;
-    type RawStream = TcpStream;
-    type Stream = TlsStream<TcpStream>;
+    type RawStream = MaybeZcRxTcpStream;
+    type Stream = TlsStream<MaybeZcRxTcpStream>;
 
     fn new(config: &TransportConfig) -> Result<Self> {
         let tcp = TcpTransport::new(config)?;
@@ -70,7 +71,7 @@ impl Transport for TlsTransport {
     }
 
     fn hint(conn: &Self::Stream, opt: SocketOpts) {
-        opt.apply(conn.get_ref().get_ref().get_ref());
+        opt.apply(conn.get_ref().get_ref().get_ref().tcp_stream());
     }
 
     async fn bind<A: ToSocketAddrs + Send + Sync>(&self, addr: A) -> Result<Self::Acceptor> {
@@ -109,6 +110,6 @@ impl Transport for TlsTransport {
 }
 
 #[cfg(feature = "websocket-native-tls")]
-pub(crate) fn get_tcpstream(s: &TlsStream<TcpStream>) -> &TcpStream {
-    s.get_ref().get_ref().get_ref()
+pub(crate) fn get_tcpstream(s: &TlsStream<MaybeZcRxTcpStream>) -> &TcpStream {
+    s.get_ref().get_ref().get_ref().tcp_stream()
 }

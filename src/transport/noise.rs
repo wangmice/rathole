@@ -2,9 +2,10 @@ use std::net::SocketAddr;
 
 use super::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use crate::config::{NoiseConfig, TransportConfig};
+use crate::io_uring_zc_rx::MaybeZcRxTcpStream;
 use anyhow::{anyhow, Context, Result};
 use snowstorm::{Builder, NoiseParams, NoiseStream};
-use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio::net::{TcpListener, ToSocketAddrs};
 
 pub struct NoiseTransport {
     tcp: TcpTransport,
@@ -32,8 +33,8 @@ impl NoiseTransport {
 
 impl Transport for NoiseTransport {
     type Acceptor = TcpListener;
-    type RawStream = TcpStream;
-    type Stream = snowstorm::stream::NoiseStream<TcpStream>;
+    type RawStream = MaybeZcRxTcpStream;
+    type Stream = snowstorm::stream::NoiseStream<MaybeZcRxTcpStream>;
 
     fn new(config: &TransportConfig) -> Result<Self> {
         let tcp = TcpTransport::new(config)?;
@@ -69,7 +70,7 @@ impl Transport for NoiseTransport {
     }
 
     fn hint(conn: &Self::Stream, opt: SocketOpts) {
-        opt.apply(conn.get_inner());
+        opt.apply(conn.get_inner().tcp_stream());
     }
 
     async fn bind<T: ToSocketAddrs + Send + Sync>(&self, addr: T) -> Result<Self::Acceptor> {

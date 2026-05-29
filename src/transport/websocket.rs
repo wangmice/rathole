@@ -6,6 +6,7 @@ use std::task::{ready, Context, Poll};
 
 use super::{AddrMaybeCached, SocketOpts, TcpTransport, TlsTransport, Transport};
 use crate::config::TransportConfig;
+use crate::io_uring_zc_rx::MaybeZcRxTcpStream;
 use anyhow::anyhow;
 use bytes::Bytes;
 use futures_core::stream::Stream;
@@ -25,14 +26,14 @@ use url::Url;
 
 #[derive(Debug)]
 enum TransportStream {
-    Insecure(TcpStream),
-    Secure(TlsStream<TcpStream>),
+    Insecure(MaybeZcRxTcpStream),
+    Secure(TlsStream<MaybeZcRxTcpStream>),
 }
 
 impl TransportStream {
     fn get_tcpstream(&self) -> &TcpStream {
         match self {
-            TransportStream::Insecure(s) => s,
+            TransportStream::Insecure(s) => s.tcp_stream(),
             TransportStream::Secure(s) => get_tcpstream(s),
         }
     }
@@ -199,7 +200,7 @@ pub struct WebsocketTransport {
 
 impl Transport for WebsocketTransport {
     type Acceptor = TcpListener;
-    type RawStream = TcpStream;
+    type RawStream = MaybeZcRxTcpStream;
     type Stream = WebsocketTunnel;
 
     fn new(config: &TransportConfig) -> anyhow::Result<Self> {

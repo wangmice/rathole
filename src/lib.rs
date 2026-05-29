@@ -4,6 +4,7 @@ mod config_watcher;
 mod constants;
 mod forward;
 mod helper;
+mod io_uring_zc_rx;
 mod multi_map;
 mod protocol;
 mod transport;
