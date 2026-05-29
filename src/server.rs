@@ -16,7 +16,7 @@ use backoff::ExponentialBackoff;
 
 use rand::RngCore;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -384,7 +384,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             server_config.post_half_close_idle_timeout.as_duration(),
             service_digest,
             session_key,
-            control_channels.clone(),
+            Arc::downgrade(&control_channels),
         );
 
         // Insert the new handle
@@ -442,7 +442,7 @@ where
         post_half_close_idle_timeout: Option<Duration>,
         service_digest: ServiceDigest,
         session_key: Nonce,
-        control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+        control_channels: Weak<RwLock<ControlChannelMap<T>>>,
     ) -> ControlChannelHandle<T> {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -519,12 +519,14 @@ where
                     error!("{:#}", err);
                 }
 
-                if control_channels.write().await.remove2(&session_key).is_some() {
-                    debug!(
-                        service = %service_name,
-                        digest = %hex::encode(service_digest),
-                        "Removed stale control channel"
-                    );
+                if let Some(control_channels) = control_channels.upgrade() {
+                    if control_channels.write().await.remove2(&session_key).is_some() {
+                        debug!(
+                            service = %service_name,
+                            digest = %hex::encode(service_digest),
+                            "Removed stale control channel"
+                        );
+                    }
                 }
             }
             .instrument(Span::current()),

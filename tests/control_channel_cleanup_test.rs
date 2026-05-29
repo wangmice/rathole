@@ -15,6 +15,10 @@ const CONFIG_PATH: &str = "tests/for_control_channel_cleanup/tcp_transport.toml"
 const SERVER_ADDR: &str = "127.0.0.1:3395";
 const SERVICE_ADDR: &str = "127.0.0.1:3396";
 const SERVICE_NAME: &str = "cleanup";
+const SHUTDOWN_CONFIG_PATH: &str = "tests/for_server_shutdown_cleanup/tcp_transport.toml";
+const SHUTDOWN_SERVER_ADDR: &str = "127.0.0.1:3401";
+const SHUTDOWN_SERVICE_ADDR: &str = "127.0.0.1:3402";
+const SHUTDOWN_SERVICE_NAME: &str = "shutdown_cleanup";
 const TOKEN: &str = "default_token_if_not_specify";
 const CURRENT_PROTO_VERSION: u8 = 1;
 
@@ -67,7 +71,7 @@ async fn server_drops_service_state_after_control_channel_heartbeat_failure() ->
     });
 
     let result = async {
-        let mut control = connect_control_channel().await?;
+        let mut control = connect_control_channel(SERVER_ADDR, SERVICE_NAME).await?;
 
         let precreated = read_until_control_cmd(
             &mut control,
@@ -103,9 +107,55 @@ async fn server_drops_service_state_after_control_channel_heartbeat_failure() ->
     result
 }
 
-async fn connect_control_channel() -> Result<TcpStream> {
-    let mut conn = wait_for_connect(SERVER_ADDR, Duration::from_secs(3)).await?;
-    let service_digest = digest(SERVICE_NAME.as_bytes());
+#[tokio::test]
+async fn server_shutdown_releases_control_handles_with_live_control_socket() -> Result<()> {
+    if cfg!(not(feature = "server")) {
+        return Ok(());
+    }
+
+    init();
+
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let server = tokio::spawn(async move {
+        run_rathole_server(SHUTDOWN_CONFIG_PATH, server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    let result = async {
+        let mut control =
+            connect_control_channel(SHUTDOWN_SERVER_ADDR, SHUTDOWN_SERVICE_NAME).await?;
+
+        let precreated = read_until_control_cmd(
+            &mut control,
+            ControlChannelCmd::CreateDataChannel,
+            Duration::from_secs(3),
+        )
+        .await?;
+        if precreated != 0 {
+            return Err(anyhow!("unexpected command before TCP pool warmup"));
+        }
+
+        wait_for_connect(SHUTDOWN_SERVICE_ADDR, Duration::from_secs(3)).await?;
+
+        server_shutdown_tx.send(true)?;
+        time::timeout(Duration::from_secs(3), server).await??;
+
+        wait_until_bindable(SHUTDOWN_SERVICE_ADDR, Duration::from_secs(3))
+            .await
+            .with_context(|| "server shutdown kept the service listener alive")?;
+
+        drop(control);
+        Ok(())
+    }
+    .await;
+
+    result
+}
+
+async fn connect_control_channel(server_addr: &str, service_name: &str) -> Result<TcpStream> {
+    let mut conn = wait_for_connect(server_addr, Duration::from_secs(3)).await?;
+    let service_digest = digest(service_name.as_bytes());
 
     write_msg(
         &mut conn,
