@@ -8,7 +8,6 @@ use crate::protocol::{
     self, read_ack, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello, UdpTraffic,
     HASH_WIDTH_IN_BYTES,
 };
-use crate::forward::forward_bidirectional_with_idle_timeout;
 use crate::transport::{SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
@@ -813,7 +812,7 @@ async fn run_tcp_connection_pool<T: 'static + Transport>(
                         if write_and_flush(&mut ch, &cmd).await.is_ok() {
                             let v = visitor.take().unwrap();
                             tokio::spawn(async move {
-                                if let Err(e) = forward_bidirectional_with_idle_timeout(
+                                if let Err(e) = T::forward_tcp(
                                     ch,
                                     v,
                                     post_half_close_idle_timeout,

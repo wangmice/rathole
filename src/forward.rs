@@ -8,8 +8,16 @@
 //! never closes its own write side, while preserving the half-close-then-
 //! respond protocol semantics that `tokio::io::copy_bidirectional` provides.
 
+#[cfg(target_os = "linux")]
+use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(target_os = "linux")]
+use tokio::io::Interest;
+#[cfg(target_os = "linux")]
+use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 
 /// Buffer size per direction. Matches Tokio's internal `io::copy` chunk size.
@@ -65,6 +73,126 @@ where
             }
             Err(e) => Err(e),
         },
+    }
+}
+
+/// Linux zero-copy TCP forwarding based on `splice(2)`.
+///
+/// This is only valid for plain TCP streams. TLS, Noise and WebSocket
+/// transports still have to pass through userspace because their stream bytes
+/// are encrypted or framed above the socket layer.
+#[cfg(target_os = "linux")]
+pub(crate) async fn splice_bidirectional_with_idle_timeout(
+    a: TcpStream,
+    b: TcpStream,
+    idle: Option<Duration>,
+) -> io::Result<()> {
+    let a = Arc::new(a);
+    let b = Arc::new(b);
+
+    let (atob_arm_tx, atob_arm_rx) = oneshot::channel::<Duration>();
+    let (btoa_arm_tx, btoa_arm_rx) = oneshot::channel::<Duration>();
+
+    let atob = splice_pump(a.clone(), b.clone(), atob_arm_rx);
+    let btoa = splice_pump(b, a, btoa_arm_rx);
+    tokio::pin!(atob);
+    tokio::pin!(btoa);
+
+    tokio::select! {
+        r = &mut atob => match r {
+            Ok(()) => {
+                if let Some(t) = idle {
+                    let _ = btoa_arm_tx.send(t);
+                }
+                btoa.await
+            }
+            Err(e) => Err(e),
+        },
+        r = &mut btoa => match r {
+            Ok(()) => {
+                if let Some(t) = idle {
+                    let _ = atob_arm_tx.send(t);
+                }
+                atob.await
+            }
+            Err(e) => Err(e),
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn splice_pump(
+    reader: Arc<TcpStream>,
+    writer: Arc<TcpStream>,
+    mut arm_idle: oneshot::Receiver<Duration>,
+) -> io::Result<()> {
+    let pipe = Pipe::new()?;
+    let mut idle: Option<Duration> = None;
+    let mut buffered = 0usize;
+
+    loop {
+        if buffered == 0 {
+            buffered =
+                splice_stream_to_pipe(&reader, &pipe, &mut arm_idle, &mut idle).await?;
+            if buffered == 0 {
+                return shutdown_socket_write(&writer);
+            }
+        }
+
+        while buffered > 0 {
+            let n =
+                splice_pipe_to_stream(&pipe, &writer, buffered, &mut arm_idle, &mut idle).await?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "splice wrote zero bytes to socket",
+                ));
+            }
+            buffered -= n;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn splice_stream_to_pipe(
+    stream: &TcpStream,
+    pipe: &Pipe,
+    arm_idle: &mut oneshot::Receiver<Duration>,
+    idle: &mut Option<Duration>,
+) -> io::Result<usize> {
+    loop {
+        await_with_arm_or_timeout(stream.readable(), arm_idle, idle).await?;
+        match stream.try_io(Interest::READABLE, || {
+            splice_raw(
+                stream.as_raw_fd(),
+                pipe.write_fd,
+                FORWARD_BUF_SIZE,
+            )
+        }) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn splice_pipe_to_stream(
+    pipe: &Pipe,
+    stream: &TcpStream,
+    len: usize,
+    arm_idle: &mut oneshot::Receiver<Duration>,
+    idle: &mut Option<Duration>,
+) -> io::Result<usize> {
+    loop {
+        await_with_arm_or_timeout(stream.writable(), arm_idle, idle).await?;
+        match stream.try_io(Interest::WRITABLE, || {
+            splice_raw(pipe.read_fd, stream.as_raw_fd(), len)
+        }) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -187,6 +315,79 @@ where
                 }
             }
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct Pipe {
+    read_fd: RawFd,
+    write_fd: RawFd,
+}
+
+#[cfg(target_os = "linux")]
+impl Pipe {
+    fn new() -> io::Result<Self> {
+        let mut fds = [0; 2];
+        cvt(unsafe {
+            libc::pipe2(
+                fds.as_mut_ptr(),
+                libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        })?;
+        Ok(Self {
+            read_fd: fds[0],
+            write_fd: fds[1],
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Pipe {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.read_fd);
+            libc::close(self.write_fd);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn splice_raw(fd_in: RawFd, fd_out: RawFd, len: usize) -> io::Result<usize> {
+    loop {
+        let r = unsafe {
+            libc::splice(
+                fd_in,
+                std::ptr::null_mut(),
+                fd_out,
+                std::ptr::null_mut(),
+                len,
+                libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
+            )
+        };
+
+        if r >= 0 {
+            return Ok(r as usize);
+        }
+
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn shutdown_socket_write(stream: &TcpStream) -> io::Result<()> {
+    cvt(unsafe { libc::shutdown(stream.as_raw_fd(), libc::SHUT_WR) })?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn cvt(r: libc::c_int) -> io::Result<libc::c_int> {
+    if r == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(r)
     }
 }
 
@@ -557,6 +758,56 @@ mod tests {
         timeout(Duration::from_secs(2), fwd)
             .await
             .expect("forwarder hung")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn tcp_pair() -> io::Result<(tokio::net::TcpStream, tokio::net::TcpStream)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (client, server) =
+            tokio::try_join!(tokio::net::TcpStream::connect(addr), listener.accept())?;
+        Ok((client, server.0))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn splice_zero_copy_forwards_bidirectional_tcp() {
+        let (mut left_client, left_proxy) = tcp_pair().await.unwrap();
+        let (mut right_client, right_proxy) = tcp_pair().await.unwrap();
+
+        let fwd = tokio::spawn(splice_bidirectional_with_idle_timeout(
+            left_proxy,
+            right_proxy,
+            Some(Duration::from_secs(2)),
+        ));
+
+        let exchange = async {
+            left_client.write_all(b"ping").await.unwrap();
+            let mut got = [0u8; 4];
+            right_client.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, b"ping");
+
+            right_client.write_all(b"pong").await.unwrap();
+            left_client.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, b"pong");
+
+            left_client.shutdown().await.unwrap();
+            right_client.shutdown().await.unwrap();
+        };
+
+        if timeout(Duration::from_secs(2), exchange).await.is_err() {
+            if fwd.is_finished() {
+                panic!("splice forwarder returned early: {:?}", fwd.await.unwrap());
+            }
+            fwd.abort();
+            panic!("splice data exchange hung");
+        }
+
+        timeout(Duration::from_secs(2), fwd)
+            .await
+            .expect("splice forwarder hung")
             .unwrap()
             .unwrap();
     }

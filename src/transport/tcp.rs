@@ -5,8 +5,13 @@ use crate::{
 
 use super::{AddrMaybeCached, SocketOpts, Transport};
 use anyhow::Result;
+use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+#[cfg(target_os = "linux")]
+use tracing::debug;
 
 #[derive(Debug)]
 pub struct TcpTransport {
@@ -49,4 +54,31 @@ impl Transport for TcpTransport {
         self.socket_opts.apply(&s);
         Ok(s)
     }
+
+    fn forward_tcp(
+        data_channel: Self::Stream,
+        peer: TcpStream,
+        idle: Option<Duration>,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        forward_tcp(data_channel, peer, idle)
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn forward_tcp(
+    data_channel: TcpStream,
+    peer: TcpStream,
+    idle: Option<Duration>,
+) -> io::Result<()> {
+    debug!("Using splice zero-copy TCP forwarding");
+    crate::forward::splice_bidirectional_with_idle_timeout(data_channel, peer, idle).await
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn forward_tcp(
+    data_channel: TcpStream,
+    peer: TcpStream,
+    idle: Option<Duration>,
+) -> io::Result<()> {
+    crate::forward::forward_bidirectional_with_idle_timeout(data_channel, peer, idle).await
 }

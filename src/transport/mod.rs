@@ -3,6 +3,7 @@ use crate::helper::{to_socket_addr, try_set_tcp_keepalive};
 use anyhow::{Context, Result};
 use std::fmt::{Debug, Display};
 use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -67,6 +68,15 @@ pub trait Transport: Debug + Send + Sync {
         conn: Self::RawStream,
     ) -> impl Future<Output = Result<Self::Stream>> + Send;
     fn connect(&self, addr: &AddrMaybeCached) -> impl Future<Output = Result<Self::Stream>> + Send;
+    fn forward_tcp(
+        data_channel: Self::Stream,
+        peer: TcpStream,
+        idle: Option<Duration>,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        async move {
+            crate::forward::forward_bidirectional_with_idle_timeout(data_channel, peer, idle).await
+        }
+    }
 }
 
 mod tcp;

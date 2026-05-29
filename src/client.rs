@@ -6,7 +6,6 @@ use crate::protocol::{
     self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ControlChannelCmd,
     DataChannelCmd, UdpTraffic, CURRENT_PROTO_VERSION, HASH_WIDTH_IN_BYTES,
 };
-use crate::forward::forward_bidirectional_with_idle_timeout;
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
@@ -283,9 +282,7 @@ async fn run_data_channel_for_tcp<T: Transport>(
     let local = TcpStream::connect(local_addr)
         .await
         .with_context(|| format!("Failed to connect to {}", local_addr))?;
-    if let Err(e) =
-        forward_bidirectional_with_idle_timeout(conn, local, post_half_close_idle_timeout).await
-    {
+    if let Err(e) = T::forward_tcp(conn, local, post_half_close_idle_timeout).await {
         log_forwarder_outcome("tcp", &e);
     }
     Ok(())
