@@ -2,14 +2,19 @@ use crate::{
     config::{ClientConfig, ClientServiceConfig, ServerConfig, ServerServiceConfig},
     Config,
 };
-use anyhow::{Context, Result};
+#[cfg(feature = "notify")]
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(feature = "notify")]
+use std::env;
 use std::{
     collections::HashMap,
-    env,
     path::{Path, PathBuf},
 };
 use tokio::sync::{broadcast, mpsc};
-use tracing::{error, info, instrument};
+use tracing::error;
+#[cfg(feature = "notify")]
+use tracing::{info, instrument};
 
 #[cfg(feature = "notify")]
 use notify::{EventKind, RecursiveMode, Watcher};

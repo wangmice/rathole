@@ -63,10 +63,8 @@ pub trait Transport: Debug + Send + Sync {
     async fn bind<T: ToSocketAddrs + Send + Sync>(&self, addr: T) -> Result<Self::Acceptor>;
     /// accept must be cancel safe
     async fn accept(&self, a: &Self::Acceptor) -> Result<(Self::RawStream, SocketAddr)>;
-    fn handshake(
-        &self,
-        conn: Self::RawStream,
-    ) -> impl Future<Output = Result<Self::Stream>> + Send;
+    fn handshake(&self, conn: Self::RawStream)
+        -> impl Future<Output = Result<Self::Stream>> + Send;
     fn connect(&self, addr: &AddrMaybeCached) -> impl Future<Output = Result<Self::Stream>> + Send;
     fn forward_tcp(
         data_channel: Self::Stream,
@@ -80,6 +78,15 @@ pub trait Transport: Debug + Send + Sync {
 }
 
 mod tcp;
+#[cfg(any(
+    feature = "client",
+    feature = "server",
+    feature = "native-tls",
+    feature = "rustls",
+    feature = "noise",
+    feature = "websocket-native-tls",
+    feature = "websocket-rustls",
+))]
 pub use tcp::TcpTransport;
 
 #[cfg(all(feature = "native-tls", feature = "rustls"))]
@@ -87,24 +94,49 @@ compile_error!("Only one of `native-tls` and `rustls` can be enabled");
 
 #[cfg(feature = "native-tls")]
 mod native_tls;
-#[cfg(feature = "native-tls")]
+#[cfg(all(
+    feature = "native-tls",
+    any(
+        feature = "client",
+        feature = "server",
+        feature = "websocket-native-tls",
+        feature = "websocket-rustls",
+    ),
+))]
 use native_tls as tls;
 #[cfg(feature = "rustls")]
 mod rustls;
-#[cfg(feature = "rustls")]
+#[cfg(all(
+    feature = "rustls",
+    any(
+        feature = "client",
+        feature = "server",
+        feature = "websocket-native-tls",
+        feature = "websocket-rustls",
+    ),
+))]
 use rustls as tls;
 
 #[cfg(any(feature = "native-tls", feature = "rustls"))]
+#[cfg(any(
+    feature = "client",
+    feature = "server",
+    feature = "websocket-native-tls",
+    feature = "websocket-rustls",
+))]
 pub(crate) use tls::TlsTransport;
 
 #[cfg(feature = "noise")]
 mod noise;
-#[cfg(feature = "noise")]
+#[cfg(all(feature = "noise", any(feature = "client", feature = "server")))]
 pub use noise::NoiseTransport;
 
 #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
 mod websocket;
-#[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
+#[cfg(all(
+    any(feature = "websocket-native-tls", feature = "websocket-rustls"),
+    any(feature = "client", feature = "server"),
+))]
 pub use websocket::WebsocketTransport;
 
 #[derive(Debug, Clone, Copy)]

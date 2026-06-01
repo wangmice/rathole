@@ -6,7 +6,7 @@ use std::fmt::Debug;
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
 
 use anyhow::{anyhow, Context, Result};
@@ -62,13 +62,15 @@ fn load_client_config(config: &TlsConfig) -> Result<Option<ClientConfig>> {
             .with_context(|| "Failed to read certificate")?
     } else {
         // read from native
-        match rustls_native_certs::load_native_certs() {
-            Ok(certs) => certs.into_iter().next().unwrap(),
-            Err(e) => {
-                eprintln!("Failed to load native certs: {}", e);
-                return Ok(None);
-            }
+        let native_certs = rustls_native_certs::load_native_certs();
+        for error in native_certs.errors {
+            eprintln!("Failed to load a native cert: {}", error);
         }
+        native_certs
+            .certs
+            .into_iter()
+            .next()
+            .with_context(|| "Failed to load any native cert")?
     };
 
     let mut root_certs = RootCertStore::empty();
@@ -150,6 +152,7 @@ impl Transport for TlsTransport {
     }
 }
 
-pub(crate) fn get_tcpstream(s: &TlsStream<MaybeZcRxTcpStream>) -> &TcpStream {
+#[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
+pub(crate) fn get_tcpstream(s: &TlsStream<MaybeZcRxTcpStream>) -> &tokio::net::TcpStream {
     s.get_ref().0.tcp_stream()
 }

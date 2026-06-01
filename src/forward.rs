@@ -15,9 +15,9 @@ use std::os::unix::io::{AsRawFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(target_os = "linux")]
 use tokio::io::Interest;
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(target_os = "linux")]
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
@@ -142,8 +142,7 @@ async fn splice_pump(
 
     loop {
         if buffered == 0 {
-            buffered =
-                splice_stream_to_pipe(&reader, &pipe, &mut arm_idle, &mut idle).await?;
+            buffered = splice_stream_to_pipe(&reader, &pipe, &mut arm_idle, &mut idle).await?;
             if buffered == 0 {
                 return shutdown_socket_write(&writer);
             }
@@ -174,11 +173,7 @@ async fn splice_stream_to_pipe(
     loop {
         await_with_arm_or_timeout(stream.readable(), arm_idle, idle).await?;
         match stream.try_io(Interest::READABLE, || {
-            splice_raw(
-                stream.as_raw_fd(),
-                pipe.write_fd,
-                FORWARD_BUF_SIZE,
-            )
+            splice_raw(stream.as_raw_fd(), pipe.write_fd, FORWARD_BUF_SIZE)
         }) {
             Ok(n) => return Ok(n),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
@@ -339,12 +334,7 @@ struct Pipe {
 impl Pipe {
     fn new() -> io::Result<Self> {
         let mut fds = [0; 2];
-        cvt(unsafe {
-            libc::pipe2(
-                fds.as_mut_ptr(),
-                libc::O_CLOEXEC | libc::O_NONBLOCK,
-            )
-        })?;
+        cvt(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) })?;
         Ok(Self {
             read_fd: fds[0],
             write_fd: fds[1],
@@ -443,9 +433,7 @@ mod tests {
         ) -> Poll<io::Result<usize>> {
             let me = self.get_mut();
             let r = Pin::new(&mut me.inner).poll_write(cx, buf);
-            if matches!(r, Poll::Pending)
-                && !me.first_pending.swap(true, Ordering::SeqCst)
-            {
+            if matches!(r, Poll::Pending) && !me.first_pending.swap(true, Ordering::SeqCst) {
                 me.notify.notify_waiters();
             }
             r

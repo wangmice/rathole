@@ -1,19 +1,22 @@
 use anyhow::Result;
-use vergen::{vergen, Config, SemverKind};
+use vergen_gitcl::{BuildBuilder, CargoBuilder, Emitter, GitclBuilder};
 
 fn main() -> Result<()> {
-    let mut config = Config::default();
-    // Change the SEMVER output to the lightweight variant
-    *config.git_mut().semver_kind_mut() = SemverKind::Lightweight;
-    // Add a `-dirty` flag to the SEMVER output
-    *config.git_mut().semver_dirty_mut() = Some("-dirty");
-    // Generate the instructions
-    if let Err(e) = vergen(config) {
-        eprintln!("error occurred while generating instructions: {:?}", e);
-        let mut config = Config::default();
-        *config.git_mut().enabled_mut() = false;
-        vergen(config)
-    } else {
-        Ok(())
-    }
+    let build = BuildBuilder::default().build_timestamp(true).build()?;
+    let cargo = CargoBuilder::default()
+        .features(true)
+        .target_triple(true)
+        .build()?;
+    let git = GitclBuilder::default()
+        .branch(true)
+        .commit_timestamp(true)
+        .describe(false, true, None)
+        .sha(false)
+        .build()?;
+
+    Emitter::default()
+        .add_instructions(&build)?
+        .add_instructions(&cargo)?
+        .add_instructions(&git)?
+        .emit()
 }

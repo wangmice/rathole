@@ -5,7 +5,7 @@ use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, Context, Result};
 use std::fs;
 use std::net::SocketAddr;
-use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio_native_tls::native_tls::{self, Certificate, Identity};
 pub(crate) use tokio_native_tls::TlsStream;
 use tokio_native_tls::{TlsAcceptor, TlsConnector};
@@ -110,6 +110,7 @@ impl Transport for TlsTransport {
 }
 
 #[cfg(feature = "websocket-native-tls")]
-pub(crate) fn get_tcpstream(s: &TlsStream<MaybeZcRxTcpStream>) -> &TcpStream {
+#[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
+pub(crate) fn get_tcpstream(s: &TlsStream<MaybeZcRxTcpStream>) -> &tokio::net::TcpStream {
     s.get_ref().get_ref().get_ref().tcp_stream()
 }

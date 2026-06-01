@@ -1,3 +1,12 @@
+#![cfg_attr(
+    any(
+        not(all(feature = "server", feature = "client")),
+        not(feature = "hot-reload"),
+        not(feature = "noise"),
+    ),
+    allow(dead_code)
+)]
+
 mod cli;
 mod config;
 mod config_watcher;
@@ -18,7 +27,7 @@ pub use constants::UDP_BUFFER_SIZE;
 
 use anyhow::Result;
 use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[cfg(feature = "client")]
 mod client;
@@ -32,8 +41,10 @@ use server::run_server;
 
 use crate::config_watcher::{ConfigChange, ConfigWatcherHandle};
 
+#[cfg(feature = "noise")]
 const DEFAULT_CURVE: KeypairType = KeypairType::X25519;
 
+#[cfg(feature = "noise")]
 fn get_str_from_keypair_type(curve: KeypairType) -> &'static str {
     match curve {
         KeypairType::X25519 => "25519",
@@ -43,6 +54,8 @@ fn get_str_from_keypair_type(curve: KeypairType) -> &'static str {
 
 #[cfg(feature = "noise")]
 fn genkey(curve: Option<KeypairType>) -> Result<()> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
     let curve = curve.unwrap_or(DEFAULT_CURVE);
     let builder = snowstorm::Builder::new(
         format!(
@@ -53,23 +66,25 @@ fn genkey(curve: Option<KeypairType>) -> Result<()> {
     );
     let keypair = builder.generate_keypair()?;
 
-    println!("Private Key:\n{}\n", base64::encode(keypair.private));
-    println!("Public Key:\n{}", base64::encode(keypair.public));
+    println!("Private Key:\n{}\n", STANDARD.encode(keypair.private));
+    println!("Public Key:\n{}", STANDARD.encode(keypair.public));
     Ok(())
 }
 
 #[cfg(not(feature = "noise"))]
-fn genkey(curve: Option<KeypairType>) -> Result<()> {
+fn genkey(_curve: Option<KeypairType>) -> Result<()> {
     crate::helper::feature_not_compile("nosie")
 }
 
 pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-    if args.genkey.is_some() {
-        return genkey(args.genkey.unwrap());
+    if let Some(curve) = args.genkey {
+        return genkey(curve);
     }
 
     // Raise `nofile` limit on linux and mac
-    fdlimit::raise_fd_limit();
+    if let Err(e) = fdlimit::raise_fd_limit() {
+        warn!("Failed to raise nofile limit: {}", e);
+    }
 
     // Spawn a config watcher. The watcher will send a initial signal to start the instance with a config
     let config_path = args.config_path.as_ref().unwrap();
@@ -124,6 +139,9 @@ async fn run_instance(
     shutdown_rx: broadcast::Receiver<bool>,
     service_update: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
+    #[cfg(not(any(feature = "client", feature = "server")))]
+    let _ = (&shutdown_rx, &service_update);
+
     match determine_run_mode(&config, &args) {
         RunMode::Undetermine => panic!("Cannot determine running as a server or a client"),
         RunMode::Client => {

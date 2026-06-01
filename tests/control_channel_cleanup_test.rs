@@ -228,18 +228,28 @@ async fn read_msg<T>(conn: &mut TcpStream, sample: &T) -> Result<T>
 where
     T: DeserializeOwned + Serialize,
 {
-    let mut buf = vec![0; bincode::serialized_size(sample)? as usize];
+    let mut buf = vec![0; encode_msg(sample)?.len()];
     conn.read_exact(&mut buf).await?;
-    Ok(bincode::deserialize(&buf)?)
+    Ok(decode_msg(&buf)?)
 }
 
 async fn write_msg<T>(conn: &mut TcpStream, msg: &T) -> Result<()>
 where
     T: Serialize,
 {
-    conn.write_all(&bincode::serialize(msg)?).await?;
+    conn.write_all(&encode_msg(msg)?).await?;
     conn.flush().await?;
     Ok(())
+}
+
+fn encode_msg<T: Serialize>(msg: &T) -> std::result::Result<Vec<u8>, bincode::error::EncodeError> {
+    bincode::serde::encode_to_vec(msg, bincode::config::legacy())
+}
+
+fn decode_msg<T: DeserializeOwned>(
+    bytes: &[u8],
+) -> std::result::Result<T, bincode::error::DecodeError> {
+    bincode::serde::decode_from_slice(bytes, bincode::config::legacy()).map(|(value, _)| value)
 }
 
 async fn wait_for_connect(addr: &str, timeout: Duration) -> Result<TcpStream> {

@@ -237,7 +237,7 @@ async fn do_data_channel_handshake<T: Transport>(
     // Send nonce
     let v: &[u8; HASH_WIDTH_IN_BYTES] = args.session_key[..].try_into().unwrap();
     let hello = Hello::DataChannelHello(CURRENT_PROTO_VERSION, v.to_owned());
-    let hello = bincode::serialize(&hello).unwrap();
+    let hello = protocol::encode(&hello).unwrap();
     match time::timeout(Duration::from_secs(DATA_CHANNEL_HANDSHAKE_TIMEOUT), async {
         conn.write_all(&hello).await?;
         conn.flush().await?;
@@ -291,8 +291,7 @@ where
         match read_data_cmd(conn).await? {
             DataChannelCmd::HeartBeat => {
                 debug!("Received data channel heartbeat");
-                conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
-                    .await?;
+                conn.write_all(&protocol::encode(&Ack::Ok).unwrap()).await?;
                 conn.flush().await?;
                 debug!("Acked data channel heartbeat");
             }
@@ -492,7 +491,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
         debug!("Sending hello");
         let hello_send =
             Hello::ControlChannelHello(CURRENT_PROTO_VERSION, self.digest[..].try_into().unwrap());
-        conn.write_all(&bincode::serialize(&hello_send).unwrap())
+        conn.write_all(&protocol::encode(&hello_send).unwrap())
             .await?;
         conn.flush().await?;
 
@@ -512,7 +511,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
 
         let session_key = protocol::digest(&concat);
         let auth = Auth(session_key);
-        conn.write_all(&bincode::serialize(&auth).unwrap()).await?;
+        conn.write_all(&protocol::encode(&auth).unwrap()).await?;
         conn.flush().await?;
 
         // Read ack
@@ -649,13 +648,13 @@ mod tests {
         let client = tokio::spawn(async move { read_forward_start_cmd(&mut client_side).await });
 
         server_side
-            .write_all(&bincode::serialize(&DataChannelCmd::HeartBeat).unwrap())
+            .write_all(&protocol::encode(&DataChannelCmd::HeartBeat).unwrap())
             .await?;
         server_side.flush().await?;
         assert!(matches!(read_ack(&mut server_side).await?, Ack::Ok));
 
         server_side
-            .write_all(&bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap())
+            .write_all(&protocol::encode(&DataChannelCmd::StartForwardTcp).unwrap())
             .await?;
         server_side.flush().await?;
 

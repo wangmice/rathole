@@ -4,6 +4,7 @@ use super::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use crate::config::{NoiseConfig, TransportConfig};
 use crate::io_uring_zc_rx::MaybeZcRxTcpStream;
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use snowstorm::{Builder, NoiseParams, NoiseStream};
 use tokio::net::{TcpListener, ToSocketAddrs};
 
@@ -46,14 +47,17 @@ impl Transport for NoiseTransport {
         let builder = Builder::new(config.pattern.parse()?);
 
         let remote_public_key = match &config.remote_public_key {
-            Some(x) => {
-                Some(base64::decode(x).with_context(|| "Failed to decode remote_public_key")?)
-            }
+            Some(x) => Some(
+                STANDARD
+                    .decode(x)
+                    .with_context(|| "Failed to decode remote_public_key")?,
+            ),
             None => None,
         };
 
         let local_private_key = match &config.local_private_key {
-            Some(x) => base64::decode(x.as_bytes())
+            Some(x) => STANDARD
+                .decode(x.as_bytes())
                 .with_context(|| "Failed to decode local_private_key")?,
             None => builder.generate_keypair()?.private,
         };

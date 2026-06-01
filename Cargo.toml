@@ -1,6 +1,6 @@
 [package]
 name = "rathole"
-version = "0.5.0-ng.1"
+version = "0.6.0"
 edition = "2021"
 authors = ["Yujia Qiao <code@rapiz.me>", "VeroFess <admin@binklac.com>"]
 description = "A reverse proxy for NAT traversal"
@@ -63,6 +63,7 @@ embedded = ["server", "client", "hot-reload", "noise"]
 # Feature to enable tokio-console. Disabled by default.
 # Don't enable it unless for debugging purposes.
 console = ["console-subscriber", "tokio/tracing"]
+notify = ["dep:notify"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [profile.dev]
@@ -86,27 +87,27 @@ codegen-units = 1
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 bytes = { version = "1", features = ["serde"] }
-clap = { version = "3.0", features = ["derive"] }
-toml = "0.5"
+clap = { version = "4.6", features = ["derive"] }
+toml = "1.1"
 serde = { version = "1.0", features = ["derive"] }
 anyhow = "1.0"
-sha2 = "0.10"
-bincode = "1"
-lazy_static = "1.4"
+sha2 = "0.11"
+bincode = { version = "2.0.1", features = ["serde"] }
+lazy_static = "1.5"
 hex = "0.4"
-rand = "0.8"
+rand = "0.10"
 libc = "0.2"
 backoff = { version = "0.4", features = ["tokio"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-socket2 = { version = "0.4", features = ["all"] }
-fdlimit = "0.2"
+socket2 = { version = "0.6", features = ["all"] }
+fdlimit = "0.3"
 snowstorm = { version = "0.4", optional = true, features = [
     "stream",
 ], default-features = false }
-base64 = { version = "0.13", optional = true }
-notify = { version = "5.0.0-pre.13", optional = true }
-console-subscriber = { version = "0.1", optional = true, features = [
+base64 = { version = "0.22", optional = true }
+notify = { version = "8.2.0", optional = true }
+console-subscriber = { version = "0.5", optional = true, features = [
     "parking_lot",
 ] }
 atty = "0.2"
@@ -114,16 +115,16 @@ async-http-proxy = { version = "1.2", features = [
     "runtime-tokio",
     "basic-auth",
 ] }
-async-socks5 = "0.5"
-url = { version = "2.2", features = ["serde"] }
-tokio-tungstenite = { version = "0.20.1", optional = true }
-tokio-util = { version = "0.7.9", optional = true, features = ["io"] }
-futures-core = { version = "0.3.28", optional = true }
-futures-sink = { version = "0.3.28", optional = true }
+async-socks5 = "0.6"
+url = { version = "2.5", features = ["serde"] }
+tokio-tungstenite = { version = "0.29.0", optional = true }
+tokio-util = { version = "0.7.18", optional = true, features = ["io"] }
+futures-core = { version = "0.3.32", optional = true }
+futures-sink = { version = "0.3.32", optional = true }
 tokio-native-tls = { version = "0.3", optional = true }
-tokio-rustls = { version = "0.25", optional = true }
-rustls-native-certs = { version = "0.7", optional = true }
-rustls-pemfile = { version = "2.0", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+rustls-pemfile = { version = "2.2", optional = true }
 p12 = { version = "0.6.3", optional = true }
 
 [target.'cfg(target_env = "musl")'.dependencies]
@@ -133,9 +134,8 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 io-uring = "0.7.12"
 
 [build-dependencies]
-vergen = { version = "7.4.2", default-features = false, features = [
+vergen-gitcl = { version = "9.1.0", default-features = false, features = [
     "build",
-    "git",
     "cargo",
 ] }
 anyhow = "1.0"

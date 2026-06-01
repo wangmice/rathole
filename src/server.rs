@@ -13,7 +13,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
 
-use rand::RngCore;
+use rand::RngExt as _;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -335,14 +335,14 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
 
     // Generate a nonce
     let mut nonce = vec![0u8; HASH_WIDTH_IN_BYTES];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rand::rng().fill(&mut nonce);
 
     // Send hello
     let hello_send = Hello::ControlChannelHello(
         protocol::CURRENT_PROTO_VERSION,
         nonce.clone().try_into().unwrap(),
     );
-    conn.write_all(&bincode::serialize(&hello_send).unwrap())
+    conn.write_all(&protocol::encode(&hello_send).unwrap())
         .await?;
     conn.flush().await?;
 
@@ -350,7 +350,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     let service_config = match services.read().await.get(&service_digest) {
         Some(v) => v,
         None => {
-            conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
+            conn.write_all(&protocol::encode(&Ack::ServiceNotExist).unwrap())
                 .await?;
             bail!("No such a service {}", hex::encode(service_digest));
         }
@@ -369,7 +369,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     // Validate
     let session_key = protocol::digest(&concat);
     if session_key != d {
-        conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
+        conn.write_all(&protocol::encode(&Ack::AuthFailed).unwrap())
             .await?;
         debug!(
             "Expect {}, but got {}",
@@ -391,8 +391,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         }
 
         // Send ack
-        conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
-            .await?;
+        conn.write_all(&protocol::encode(&Ack::Ok).unwrap()).await?;
         conn.flush().await?;
 
         info!(service = %service_config.name, "Control channel established");
@@ -579,8 +578,8 @@ impl<T: Transport> ControlChannel<T> {
     // Run a control channel
     #[instrument(skip_all)]
     async fn run(mut self) -> Result<()> {
-        let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel).unwrap();
-        let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat).unwrap();
+        let create_ch_cmd = protocol::encode(&ControlChannelCmd::CreateDataChannel).unwrap();
+        let heartbeat = protocol::encode(&ControlChannelCmd::HeartBeat).unwrap();
 
         // Wait for data channel requests and the shutdown signal
         loop {
@@ -962,41 +961,50 @@ where
     }
 }
 
+struct TcpVisitorServeConfig<'a> {
+    heartbeat_cmd: &'a [u8],
+    start_forward_cmd: &'a [u8],
+    post_half_close_idle_timeout: Option<Duration>,
+    visitor_wait_timeout: Duration,
+    data_channel_request_timeout: Duration,
+}
+
 async fn serve_ready_tcp_visitors<T: 'static + Transport>(
     visitor_queue: &mut VecDeque<PendingTcpVisitor>,
     pool: &mut VecDeque<PooledTcpDataChannel<T::Stream>>,
     data_ch_req_tx: &mpsc::UnboundedSender<bool>,
     pending_data_channels: &mut VecDeque<time::Instant>,
-    heartbeat_cmd: &[u8],
-    start_forward_cmd: &[u8],
-    post_half_close_idle_timeout: Option<Duration>,
-    visitor_wait_timeout: Duration,
-    data_channel_request_timeout: Duration,
+    config: &TcpVisitorServeConfig<'_>,
 ) -> bool {
     loop {
-        drop_stale_tcp_visitors(visitor_queue, visitor_wait_timeout);
+        drop_stale_tcp_visitors(visitor_queue, config.visitor_wait_timeout);
 
         let Some(visitor) = visitor_queue.pop_front() else {
             return true;
         };
 
         loop {
-            let Some(mut ch) =
-                pop_tcp_pool_channel(pool, data_ch_req_tx, pending_data_channels, heartbeat_cmd)
-                    .await
+            let Some(mut ch) = pop_tcp_pool_channel(
+                pool,
+                data_ch_req_tx,
+                pending_data_channels,
+                config.heartbeat_cmd,
+            )
+            .await
             else {
                 visitor_queue.push_front(visitor);
                 return true;
             };
 
             match time::timeout(
-                data_channel_request_timeout,
-                write_and_flush(&mut ch, start_forward_cmd),
+                config.data_channel_request_timeout,
+                write_and_flush(&mut ch, config.start_forward_cmd),
             )
             .await
             {
                 Ok(Ok(())) => {
                     let v = visitor.stream;
+                    let post_half_close_idle_timeout = config.post_half_close_idle_timeout;
                     tokio::spawn(async move {
                         if let Err(e) = T::forward_tcp(ch, v, post_half_close_idle_timeout).await {
                             log_forwarder_outcome("tcp", &e);
@@ -1032,8 +1040,8 @@ async fn run_tcp_connection_pool<T: 'static + Transport>(
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let mut visitor_rx = tcp_listen_and_send(bind_addr, shutdown_rx);
-    let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
-    let heartbeat_cmd = bincode::serialize(&DataChannelCmd::HeartBeat).unwrap();
+    let cmd = protocol::encode(&DataChannelCmd::StartForwardTcp).unwrap();
+    let heartbeat_cmd = protocol::encode(&DataChannelCmd::HeartBeat).unwrap();
     let mut pool: VecDeque<PooledTcpDataChannel<T::Stream>> = VecDeque::new();
     let mut visitor_queue: VecDeque<PendingTcpVisitor> = VecDeque::new();
     let mut pending_data_channels: VecDeque<time::Instant> = VecDeque::new();
@@ -1043,6 +1051,13 @@ async fn run_tcp_connection_pool<T: 'static + Transport>(
     let mut visitor_cleanup_interval = time::interval(Duration::from_secs(1));
     let visitor_wait_timeout = Duration::from_secs(TCP_VISITOR_WAIT_TIMEOUT);
     let data_channel_request_timeout = Duration::from_secs(TCP_DATA_CHANNEL_REQUEST_TIMEOUT);
+    let visitor_serve_config = TcpVisitorServeConfig {
+        heartbeat_cmd: &heartbeat_cmd,
+        start_forward_cmd: &cmd,
+        post_half_close_idle_timeout,
+        visitor_wait_timeout,
+        data_channel_request_timeout,
+    };
 
     loop {
         expire_pending_data_channels(&mut pending_data_channels, data_channel_request_timeout);
@@ -1052,11 +1067,7 @@ async fn run_tcp_connection_pool<T: 'static + Transport>(
             &mut pool,
             &data_ch_req_tx,
             &mut pending_data_channels,
-            &heartbeat_cmd,
-            &cmd,
-            post_half_close_idle_timeout,
-            visitor_wait_timeout,
-            data_channel_request_timeout,
+            &visitor_serve_config,
         )
         .await
         {
@@ -1157,7 +1168,7 @@ async fn run_udp_connection_pool<T: Transport>(
 
     info!("Listening at {}", &bind_addr);
 
-    let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp).unwrap();
+    let cmd = protocol::encode(&DataChannelCmd::StartForwardUdp).unwrap();
 
     // Receive one data channel
     let mut conn = data_ch_rx
@@ -1234,7 +1245,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_pool_heartbeat_accepts_ack() -> Result<()> {
         let (server_side, mut client_side) = duplex(64);
-        let heartbeat_cmd = bincode::serialize(&DataChannelCmd::HeartBeat).unwrap();
+        let heartbeat_cmd = protocol::encode(&DataChannelCmd::HeartBeat).unwrap();
 
         let client = tokio::spawn(async move {
             assert!(matches!(
@@ -1243,7 +1254,7 @@ mod tests {
                     .unwrap(),
                 DataChannelCmd::HeartBeat
             ));
-            write_and_flush(&mut client_side, &bincode::serialize(&Ack::Ok).unwrap())
+            write_and_flush(&mut client_side, &protocol::encode(&Ack::Ok).unwrap())
                 .await
                 .unwrap();
         });
@@ -1270,7 +1281,7 @@ mod tests {
                 - Duration::from_secs(TCP_POOL_HEARTBEAT_INTERVAL + 1),
         });
 
-        let heartbeat_cmd = bincode::serialize(&DataChannelCmd::HeartBeat).unwrap();
+        let heartbeat_cmd = protocol::encode(&DataChannelCmd::HeartBeat).unwrap();
         let mut selected =
             next_tcp_pool_channel(&mut pool, &mut data_ch_rx, &data_ch_req_tx, &heartbeat_cmd)
                 .await
@@ -1280,7 +1291,7 @@ mod tests {
 
         write_and_flush(
             &mut selected,
-            &bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap(),
+            &protocol::encode(&DataChannelCmd::StartForwardTcp).unwrap(),
         )
         .await?;
         assert!(matches!(
@@ -1294,7 +1305,7 @@ mod tests {
     async fn tcp_pool_heartbeat_times_out_when_write_stalls() -> Result<()> {
         let err = check_tcp_pool_channel_with_timeout(
             PendingHeartbeatWrite,
-            bincode::serialize(&DataChannelCmd::HeartBeat).unwrap(),
+            protocol::encode(&DataChannelCmd::HeartBeat).unwrap(),
             Duration::from_millis(10),
         )
         .await
@@ -1367,7 +1378,7 @@ mod tests {
             refresh_tcp_pool_with_timeout(
                 &mut pool,
                 checked_ch_tx,
-                &bincode::serialize(&DataChannelCmd::HeartBeat).unwrap(),
+                &protocol::encode(&DataChannelCmd::HeartBeat).unwrap(),
                 Duration::from_millis(10),
             ),
         )
@@ -1402,7 +1413,7 @@ mod tests {
             refresh_tcp_pool_with_timeout(
                 &mut pool,
                 checked_ch_tx,
-                &bincode::serialize(&DataChannelCmd::HeartBeat).unwrap(),
+                &protocol::encode(&DataChannelCmd::HeartBeat).unwrap(),
                 Duration::from_millis(10),
             ),
         )

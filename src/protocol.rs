@@ -3,7 +3,7 @@ pub const HASH_WIDTH_IN_BYTES: usize = 32;
 use anyhow::{bail, Context, Result};
 use bytes::{Bytes, BytesMut};
 use lazy_static::lazy_static;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::trace;
@@ -16,6 +16,24 @@ const PROTO_V2: u8 = 2u8;
 pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V2;
 
 pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
+
+pub(crate) fn encode<T: Serialize>(
+    value: &T,
+) -> std::result::Result<Vec<u8>, bincode::error::EncodeError> {
+    bincode::serde::encode_to_vec(value, bincode::config::legacy())
+}
+
+fn decode<T: DeserializeOwned>(
+    bytes: &[u8],
+) -> std::result::Result<T, bincode::error::DecodeError> {
+    bincode::serde::decode_from_slice(bytes, bincode::config::legacy()).map(|(value, _)| value)
+}
+
+fn encoded_size<T: Serialize>(
+    value: &T,
+) -> std::result::Result<usize, bincode::error::EncodeError> {
+    encode(value).map(|bytes| bytes.len())
+}
 
 #[derive(Deserialize, Serialize, Debug)]
 pub enum Hello {
@@ -80,7 +98,7 @@ impl UdpTraffic {
             len: self.data.len() as UdpPacketLen,
         };
 
-        let v = bincode::serialize(&hdr).unwrap();
+        let v = encode(&hdr).unwrap();
 
         trace!("Write {:?} of length {}", hdr, v.len());
         writer.write_u8(v.len() as u8).await?;
@@ -102,7 +120,7 @@ impl UdpTraffic {
             len: data.len() as UdpPacketLen,
         };
 
-        let v = bincode::serialize(&hdr).unwrap();
+        let v = encode(&hdr).unwrap();
 
         trace!("Write {:?} of length {}", hdr, v.len());
         writer.write_u8(v.len() as u8).await?;
@@ -120,8 +138,7 @@ impl UdpTraffic {
             .await
             .with_context(|| "Failed to read udp header")?;
 
-        let hdr: UdpHeader =
-            bincode::deserialize(&buf).with_context(|| "Failed to deserialize UdpHeader")?;
+        let hdr: UdpHeader = decode(&buf).with_context(|| "Failed to deserialize UdpHeader")?;
 
         trace!("hdr {:?}", hdr);
 
@@ -154,15 +171,13 @@ impl PacketLength {
     pub fn new() -> PacketLength {
         let username = "default";
         let d = digest(username.as_bytes());
-        let hello = bincode::serialized_size(&Hello::ControlChannelHello(CURRENT_PROTO_VERSION, d))
-            .unwrap() as usize;
-        let c_cmd =
-            bincode::serialized_size(&ControlChannelCmd::CreateDataChannel).unwrap() as usize;
-        let d_cmd = bincode::serialized_size(&DataChannelCmd::StartForwardTcp).unwrap() as usize;
+        let hello = encoded_size(&Hello::ControlChannelHello(CURRENT_PROTO_VERSION, d)).unwrap();
+        let c_cmd = encoded_size(&ControlChannelCmd::CreateDataChannel).unwrap();
+        let d_cmd = encoded_size(&DataChannelCmd::StartForwardTcp).unwrap();
         let ack = Ack::Ok;
-        let ack = bincode::serialized_size(&ack).unwrap() as usize;
+        let ack = encoded_size(&ack).unwrap();
 
-        let auth = bincode::serialized_size(&Auth(d)).unwrap() as usize;
+        let auth = encoded_size(&Auth(d)).unwrap();
         PacketLength {
             hello,
             ack,
@@ -182,7 +197,7 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resu
     conn.read_exact(&mut buf)
         .await
         .with_context(|| "Failed to read hello")?;
-    let hello = bincode::deserialize(&buf).with_context(|| "Failed to deserialize hello")?;
+    let hello = decode(&buf).with_context(|| "Failed to deserialize hello")?;
 
     match hello {
         Hello::ControlChannelHello(v, _) => {
@@ -213,7 +228,7 @@ pub async fn read_auth<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resul
     conn.read_exact(&mut buf)
         .await
         .with_context(|| "Failed to read auth")?;
-    bincode::deserialize(&buf).with_context(|| "Failed to deserialize auth")
+    decode(&buf).with_context(|| "Failed to deserialize auth")
 }
 
 pub async fn read_ack<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Ack> {
@@ -221,7 +236,7 @@ pub async fn read_ack<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result
     conn.read_exact(&mut bytes)
         .await
         .with_context(|| "Failed to read ack")?;
-    bincode::deserialize(&bytes).with_context(|| "Failed to deserialize ack")
+    decode(&bytes).with_context(|| "Failed to deserialize ack")
 }
 
 pub async fn read_control_cmd<T: AsyncRead + AsyncWrite + Unpin>(
@@ -231,7 +246,7 @@ pub async fn read_control_cmd<T: AsyncRead + AsyncWrite + Unpin>(
     conn.read_exact(&mut bytes)
         .await
         .with_context(|| "Failed to read cmd")?;
-    bincode::deserialize(&bytes).with_context(|| "Failed to deserialize control cmd")
+    decode(&bytes).with_context(|| "Failed to deserialize control cmd")
 }
 
 pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
@@ -241,5 +256,5 @@ pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
     conn.read_exact(&mut bytes)
         .await
         .with_context(|| "Failed to read cmd")?;
-    bincode::deserialize(&bytes).with_context(|| "Failed to deserialize data cmd")
+    decode(&bytes).with_context(|| "Failed to deserialize data cmd")
 }
