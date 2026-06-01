@@ -30,6 +30,11 @@ use crate::transport::WebsocketTransport;
 
 use crate::constants::{run_control_chan_backoff, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT};
 
+#[cfg(not(test))]
+const DATA_CHANNEL_HANDSHAKE_TIMEOUT: u64 = 15;
+#[cfg(test)]
+const DATA_CHANNEL_HANDSHAKE_TIMEOUT: u64 = 1;
+
 // The entrypoint of running a client
 pub async fn run_client(
     config: Config,
@@ -206,11 +211,20 @@ async fn do_data_channel_handshake<T: Transport>(
     let mut conn: T::Stream = retry_notify(
         backoff,
         || async {
-            args.connector
-                .connect(&args.remote_addr)
-                .await
-                .with_context(|| format!("Failed to connect to {}", &args.remote_addr))
-                .map_err(backoff::Error::transient)
+            match time::timeout(
+                Duration::from_secs(DATA_CHANNEL_HANDSHAKE_TIMEOUT),
+                args.connector.connect(&args.remote_addr),
+            )
+            .await
+            {
+                Ok(result) => result
+                    .with_context(|| format!("Failed to connect to {}", &args.remote_addr))
+                    .map_err(backoff::Error::transient),
+                Err(_) => Err(backoff::Error::transient(anyhow!(
+                    "Timed out connecting data channel to {}",
+                    &args.remote_addr
+                ))),
+            }
         },
         |e, duration| {
             warn!("{:#}. Retry in {:?}", e, duration);
@@ -223,8 +237,17 @@ async fn do_data_channel_handshake<T: Transport>(
     // Send nonce
     let v: &[u8; HASH_WIDTH_IN_BYTES] = args.session_key[..].try_into().unwrap();
     let hello = Hello::DataChannelHello(CURRENT_PROTO_VERSION, v.to_owned());
-    conn.write_all(&bincode::serialize(&hello).unwrap()).await?;
-    conn.flush().await?;
+    let hello = bincode::serialize(&hello).unwrap();
+    match time::timeout(Duration::from_secs(DATA_CHANNEL_HANDSHAKE_TIMEOUT), async {
+        conn.write_all(&hello).await?;
+        conn.flush().await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => bail!("Timed out sending data channel hello"),
+    }
 
     Ok(conn)
 }

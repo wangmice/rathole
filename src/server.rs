@@ -39,6 +39,14 @@ const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 const TCP_POOL_HEARTBEAT_INTERVAL: u64 = 30; // Application-layer heartbeat for idle TCP data channels
 const TCP_POOL_HEARTBEAT_TIMEOUT: u64 = 5;
+#[cfg(not(test))]
+const TCP_VISITOR_WAIT_TIMEOUT: u64 = 30; // Max time an accepted visitor may wait for a data channel
+#[cfg(test)]
+const TCP_VISITOR_WAIT_TIMEOUT: u64 = 1;
+#[cfg(not(test))]
+const TCP_DATA_CHANNEL_REQUEST_TIMEOUT: u64 = 15; // Max time a data-channel request may remain pending
+#[cfg(test)]
+const TCP_DATA_CHANNEL_REQUEST_TIMEOUT: u64 = 1;
 
 // Surface the outcome of a forwarder task. Only the leak-guard reaper
 // (the typed `PostHalfCloseIdleTimeout` sentinel) is debug-level; generic
@@ -214,18 +222,25 @@ impl<T: 'static + Transport> Server<T> {
                                     Ok(conn) => match conn
                                         .with_context(|| "Failed to do transport handshake")
                                     {
-                                        Ok(conn) => {
-                                            if let Err(err) = handle_connection(
+                                        Ok(conn) => match time::timeout(
+                                            Duration::from_secs(HANDSHAKE_TIMEOUT),
+                                            handle_connection(
                                                 conn,
                                                 services,
                                                 control_channels,
                                                 server_config,
-                                            )
-                                            .await
-                                            {
+                                            ),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(())) => {}
+                                            Ok(Err(err)) => {
                                                 error!("{:#}", err);
                                             }
-                                        }
+                                            Err(e) => {
+                                                error!("Protocol handshake timeout: {}", e);
+                                            }
+                                        },
                                         Err(e) => {
                                             error!("{:#}", e);
                                         }
@@ -456,19 +471,6 @@ where
 
         // Store data channel creation requests
         let (data_ch_req_tx, data_ch_req_rx) = mpsc::unbounded_channel();
-        let data_ch_tx_for_pool = data_ch_tx.clone();
-
-        // Cache some data channels for later use
-        let pool_size = match service.service_type {
-            ServiceType::Tcp => TCP_POOL_SIZE,
-            ServiceType::Udp => UDP_POOL_SIZE,
-        };
-
-        for _i in 0..pool_size {
-            if let Err(e) = data_ch_req_tx.send(true) {
-                error!("Failed to request data channel {}", e);
-            };
-        }
 
         let shutdown_rx_clone = shutdown_tx.subscribe();
         let bind_addr = service.bind_addr.clone();
@@ -478,9 +480,9 @@ where
                     if let Err(e) = run_tcp_connection_pool::<T>(
                         bind_addr,
                         post_half_close_idle_timeout,
-                        data_ch_tx_for_pool,
                         data_ch_rx,
                         data_ch_req_tx,
+                        TCP_POOL_SIZE,
                         shutdown_rx_clone,
                     )
                     .await
@@ -491,22 +493,30 @@ where
                 }
                 .instrument(Span::current()),
             ),
-            ServiceType::Udp => tokio::spawn(
-                async move {
-                    if let Err(e) = run_udp_connection_pool::<T>(
-                        bind_addr,
-                        data_ch_rx,
-                        data_ch_req_tx,
-                        shutdown_rx_clone,
-                    )
-                    .await
-                    .with_context(|| "Failed to run TCP connection pool")
-                    {
-                        error!("{:#}", e);
-                    }
+            ServiceType::Udp => {
+                for _i in 0..UDP_POOL_SIZE {
+                    if let Err(e) = data_ch_req_tx.send(true) {
+                        error!("Failed to request data channel {}", e);
+                    };
                 }
-                .instrument(Span::current()),
-            ),
+
+                tokio::spawn(
+                    async move {
+                        if let Err(e) = run_udp_connection_pool::<T>(
+                            bind_addr,
+                            data_ch_rx,
+                            data_ch_req_tx,
+                            shutdown_rx_clone,
+                        )
+                        .await
+                        .with_context(|| "Failed to run TCP connection pool")
+                        {
+                            error!("{:#}", e);
+                        }
+                    }
+                    .instrument(Span::current()),
+                )
+            }
         };
 
         // Create the control channel
@@ -611,80 +621,93 @@ impl<T: Transport> ControlChannel<T> {
     }
 }
 
+struct PendingTcpVisitor {
+    stream: TcpStream,
+    accepted_at: time::Instant,
+}
+
 fn tcp_listen_and_send(
     addr: String,
-    data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
-) -> mpsc::Receiver<TcpStream> {
+) -> mpsc::Receiver<PendingTcpVisitor> {
     let (tx, rx) = mpsc::channel(CHAN_SIZE);
 
-    tokio::spawn(async move {
-        let l = retry_notify_with_deadline(listen_backoff(),  || async {
-            Ok(TcpListener::bind(&addr).await?)
-        }, |e, duration| {
-            error!("{:#}. Retry in {:?}", e, duration);
-        }, &mut shutdown_rx).await
-        .with_context(|| "Failed to listen for the service");
-
-        let l: TcpListener = match l {
-            Ok(v) => v,
-            Err(e) => {
-                error!("{:#}", e);
-                return;
-            }
-        };
-
-        info!("Listening at {}", &addr);
-
-        // Retry at least every 1s
-        let mut backoff = ExponentialBackoff {
-            max_interval: Duration::from_secs(1),
-            max_elapsed_time: None,
-            ..Default::default()
-        };
-
-        // Wait for visitors and the shutdown signal
-        loop {
-            tokio::select! {
-                val = l.accept() => {
-                    match val {
-                        Err(e) => {
-                            // `l` is a TCP listener so this must be a IO error
-                            // Possibly a EMFILE. So sleep for a while
-                            error!("{}. Sleep for a while", e);
-                            if let Some(d) = backoff.next_backoff() {
-                                time::sleep(d).await;
-                            } else {
-                                // This branch will never be reached for current backoff policy
-                                error!("Too many retries. Aborting...");
-                                break;
-                            }
-                        }
-                        Ok((incoming, addr)) => {
-                            // For every visitor, request to create a data channel
-                            if data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
-                                // An error indicates the control channel is broken
-                                // So break the loop
-                                break;
-                            }
-
-                            backoff.reset();
-
-                            debug!("New visitor from {}", addr);
-
-                            // Send the visitor to the connection pool
-                            let _ = tx.send(incoming).await;
-                        }
-                    }
+    tokio::spawn(
+        async move {
+            let l = retry_notify_with_deadline(
+                listen_backoff(),
+                || async { Ok(TcpListener::bind(&addr).await?) },
+                |e, duration| {
+                    error!("{:#}. Retry in {:?}", e, duration);
                 },
-                _ = shutdown_rx.recv() => {
-                    break;
+                &mut shutdown_rx,
+            )
+            .await
+            .with_context(|| "Failed to listen for the service");
+
+            let l: TcpListener = match l {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("{:#}", e);
+                    return;
+                }
+            };
+
+            info!("Listening at {}", &addr);
+
+            // Retry at least every 1s
+            let mut backoff = ExponentialBackoff {
+                max_interval: Duration::from_secs(1),
+                max_elapsed_time: None,
+                ..Default::default()
+            };
+
+            // Wait for visitors and the shutdown signal
+            loop {
+                tokio::select! {
+                    val = l.accept() => {
+                        match val {
+                            Err(e) => {
+                                // `l` is a TCP listener so this must be a IO error
+                                // Possibly a EMFILE. So sleep for a while
+                                error!("{}. Sleep for a while", e);
+                                if let Some(d) = backoff.next_backoff() {
+                                    time::sleep(d).await;
+                                } else {
+                                    // This branch will never be reached for current backoff policy
+                                    error!("Too many retries. Aborting...");
+                                    break;
+                                }
+                            }
+                            Ok((incoming, addr)) => {
+                                backoff.reset();
+
+                                debug!("New visitor from {}", addr);
+
+                                // Send the visitor to the connection pool
+                                if tx
+                                    .send(PendingTcpVisitor {
+                                        stream: incoming,
+                                        accepted_at: time::Instant::now(),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    },
+                    _ = shutdown_rx.recv() => {
+                        break;
+                    }
                 }
             }
-        }
 
-        info!("TCPListener shutdown");
-    }.instrument(Span::current()));
+            info!("TCPListener shutdown");
+        }
+        .instrument(Span::current()),
+    );
 
     rx
 }
@@ -692,6 +715,11 @@ fn tcp_listen_and_send(
 struct PooledTcpDataChannel<S> {
     conn: S,
     last_checked: time::Instant,
+}
+
+enum TcpPoolCheckResult<S> {
+    Healthy(S),
+    Unhealthy,
 }
 
 async fn check_tcp_pool_channel<S>(conn: S, heartbeat_cmd: Vec<u8>) -> Result<S>
@@ -734,32 +762,32 @@ where
 
 async fn refresh_tcp_pool<S>(
     pool: &mut VecDeque<PooledTcpDataChannel<S>>,
-    data_ch_tx: mpsc::Sender<S>,
-    data_ch_req_tx: &mpsc::UnboundedSender<bool>,
+    checked_ch_tx: mpsc::Sender<TcpPoolCheckResult<S>>,
     heartbeat_cmd: &[u8],
-) where
+) -> usize
+where
     S: 'static + AsyncRead + AsyncWrite + Unpin + Send,
 {
     refresh_tcp_pool_with_timeout(
         pool,
-        data_ch_tx,
-        data_ch_req_tx,
+        checked_ch_tx,
         heartbeat_cmd,
         Duration::from_secs(TCP_POOL_HEARTBEAT_TIMEOUT),
     )
-    .await;
+    .await
 }
 
 async fn refresh_tcp_pool_with_timeout<S>(
     pool: &mut VecDeque<PooledTcpDataChannel<S>>,
-    data_ch_tx: mpsc::Sender<S>,
-    data_ch_req_tx: &mpsc::UnboundedSender<bool>,
+    checked_ch_tx: mpsc::Sender<TcpPoolCheckResult<S>>,
     heartbeat_cmd: &[u8],
     heartbeat_timeout: Duration,
-) where
+) -> usize
+where
     S: 'static + AsyncRead + AsyncWrite + Unpin + Send,
 {
     let now = time::Instant::now();
+    let mut spawned = 0usize;
 
     let pool_len = pool.len();
     for _ in 0..pool_len {
@@ -774,27 +802,34 @@ async fn refresh_tcp_pool_with_timeout<S>(
             continue;
         }
 
-        let data_ch_tx = data_ch_tx.clone();
-        let data_ch_req_tx = data_ch_req_tx.clone();
+        spawned += 1;
+        let checked_ch_tx = checked_ch_tx.clone();
         let heartbeat_cmd = heartbeat_cmd.to_vec();
         tokio::spawn(async move {
             match check_tcp_pool_channel_with_timeout(pooled.conn, heartbeat_cmd, heartbeat_timeout)
                 .await
             {
                 Ok(conn) => {
-                    if data_ch_tx.send(conn).await.is_err() {
+                    if checked_ch_tx
+                        .send(TcpPoolCheckResult::Healthy(conn))
+                        .await
+                        .is_err()
+                    {
                         debug!("Dropping healthy TCP data channel after pool shutdown");
                     }
                 }
                 Err(e) => {
                     debug!("Dropping unhealthy idle TCP data channel: {:#}", e);
-                    let _ = data_ch_req_tx.send(true);
+                    let _ = checked_ch_tx.send(TcpPoolCheckResult::Unhealthy).await;
                 }
             }
         });
     }
+
+    spawned
 }
 
+#[cfg(test)]
 async fn next_tcp_pool_channel<S>(
     pool: &mut VecDeque<PooledTcpDataChannel<S>>,
     data_ch_rx: &mut mpsc::Receiver<S>,
@@ -825,29 +860,234 @@ where
     }
 }
 
+fn request_data_channels(
+    data_ch_req_tx: &mpsc::UnboundedSender<bool>,
+    pending_data_channels: &mut VecDeque<time::Instant>,
+    count: usize,
+) -> bool {
+    let now = time::Instant::now();
+    for _ in 0..count {
+        if data_ch_req_tx.send(true).is_err() {
+            return false;
+        }
+        pending_data_channels.push_back(now);
+    }
+    true
+}
+
+fn expire_pending_data_channels(
+    pending_data_channels: &mut VecDeque<time::Instant>,
+    request_timeout: Duration,
+) {
+    let now = time::Instant::now();
+    let before = pending_data_channels.len();
+
+    while matches!(
+        pending_data_channels.front(),
+        Some(created_at) if now.duration_since(*created_at) >= request_timeout
+    ) {
+        pending_data_channels.pop_front();
+    }
+
+    let expired = before - pending_data_channels.len();
+    if expired > 0 {
+        warn!(
+            expired,
+            "Expired pending TCP data channel requests before a data channel arrived"
+        );
+    }
+}
+
+fn ensure_tcp_data_channels(
+    pool_len: usize,
+    queued_visitors: usize,
+    checking_pool_channels: usize,
+    pool_target: usize,
+    pending_data_channels: &mut VecDeque<time::Instant>,
+    data_ch_req_tx: &mpsc::UnboundedSender<bool>,
+) -> bool {
+    let desired = pool_target.saturating_add(queued_visitors);
+    let available = pool_len
+        .saturating_add(checking_pool_channels)
+        .saturating_add(pending_data_channels.len());
+
+    if desired <= available {
+        return true;
+    }
+
+    request_data_channels(data_ch_req_tx, pending_data_channels, desired - available)
+}
+
+fn drop_stale_tcp_visitors(
+    visitor_queue: &mut VecDeque<PendingTcpVisitor>,
+    visitor_wait_timeout: Duration,
+) {
+    let now = time::Instant::now();
+    let before = visitor_queue.len();
+    visitor_queue.retain(|visitor| now.duration_since(visitor.accepted_at) < visitor_wait_timeout);
+    let dropped = before - visitor_queue.len();
+
+    if dropped > 0 {
+        warn!(
+            dropped,
+            "Dropped stale TCP visitors that waited too long for data channels"
+        );
+    }
+}
+
+async fn pop_tcp_pool_channel<S>(
+    pool: &mut VecDeque<PooledTcpDataChannel<S>>,
+    data_ch_req_tx: &mpsc::UnboundedSender<bool>,
+    pending_data_channels: &mut VecDeque<time::Instant>,
+    heartbeat_cmd: &[u8],
+) -> Option<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        let pooled = pool.pop_front()?;
+        if pooled.last_checked.elapsed() < Duration::from_secs(TCP_POOL_HEARTBEAT_INTERVAL) {
+            return Some(pooled.conn);
+        }
+
+        match check_tcp_pool_channel(pooled.conn, heartbeat_cmd.to_vec()).await {
+            Ok(conn) => return Some(conn),
+            Err(e) => {
+                debug!("Dropping unhealthy idle TCP data channel: {:#}", e);
+                if !request_data_channels(data_ch_req_tx, pending_data_channels, 1) {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+async fn serve_ready_tcp_visitors<T: 'static + Transport>(
+    visitor_queue: &mut VecDeque<PendingTcpVisitor>,
+    pool: &mut VecDeque<PooledTcpDataChannel<T::Stream>>,
+    data_ch_req_tx: &mpsc::UnboundedSender<bool>,
+    pending_data_channels: &mut VecDeque<time::Instant>,
+    heartbeat_cmd: &[u8],
+    start_forward_cmd: &[u8],
+    post_half_close_idle_timeout: Option<Duration>,
+    visitor_wait_timeout: Duration,
+    data_channel_request_timeout: Duration,
+) -> bool {
+    loop {
+        drop_stale_tcp_visitors(visitor_queue, visitor_wait_timeout);
+
+        let Some(visitor) = visitor_queue.pop_front() else {
+            return true;
+        };
+
+        loop {
+            let Some(mut ch) =
+                pop_tcp_pool_channel(pool, data_ch_req_tx, pending_data_channels, heartbeat_cmd)
+                    .await
+            else {
+                visitor_queue.push_front(visitor);
+                return true;
+            };
+
+            match time::timeout(
+                data_channel_request_timeout,
+                write_and_flush(&mut ch, start_forward_cmd),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    let v = visitor.stream;
+                    tokio::spawn(async move {
+                        if let Err(e) = T::forward_tcp(ch, v, post_half_close_idle_timeout).await {
+                            log_forwarder_outcome("tcp", &e);
+                        }
+                    });
+                    break;
+                }
+                Ok(Err(e)) => {
+                    debug!(
+                        "Dropping TCP data channel that rejected start command: {:#}",
+                        e
+                    );
+                }
+                Err(_) => {
+                    debug!("Dropping TCP data channel that timed out on start command");
+                }
+            }
+
+            if !request_data_channels(data_ch_req_tx, pending_data_channels, 1) {
+                return false;
+            }
+        }
+    }
+}
+
 #[instrument(skip_all)]
 async fn run_tcp_connection_pool<T: 'static + Transport>(
     bind_addr: String,
     post_half_close_idle_timeout: Option<Duration>,
-    data_ch_tx: mpsc::Sender<T::Stream>,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    pool_target: usize,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
+    let mut visitor_rx = tcp_listen_and_send(bind_addr, shutdown_rx);
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
     let heartbeat_cmd = bincode::serialize(&DataChannelCmd::HeartBeat).unwrap();
     let mut pool: VecDeque<PooledTcpDataChannel<T::Stream>> = VecDeque::new();
+    let mut visitor_queue: VecDeque<PendingTcpVisitor> = VecDeque::new();
+    let mut pending_data_channels: VecDeque<time::Instant> = VecDeque::new();
+    let mut checking_pool_channels = 0usize;
+    let (checked_ch_tx, mut checked_ch_rx) = mpsc::channel(CHAN_SIZE);
     let mut heartbeat_interval = time::interval(Duration::from_secs(TCP_POOL_HEARTBEAT_INTERVAL));
+    let mut visitor_cleanup_interval = time::interval(Duration::from_secs(1));
+    let visitor_wait_timeout = Duration::from_secs(TCP_VISITOR_WAIT_TIMEOUT);
+    let data_channel_request_timeout = Duration::from_secs(TCP_DATA_CHANNEL_REQUEST_TIMEOUT);
 
     loop {
+        expire_pending_data_channels(&mut pending_data_channels, data_channel_request_timeout);
+
+        if !serve_ready_tcp_visitors::<T>(
+            &mut visitor_queue,
+            &mut pool,
+            &data_ch_req_tx,
+            &mut pending_data_channels,
+            &heartbeat_cmd,
+            &cmd,
+            post_half_close_idle_timeout,
+            visitor_wait_timeout,
+            data_channel_request_timeout,
+        )
+        .await
+        {
+            break;
+        }
+
+        if !ensure_tcp_data_channels(
+            pool.len(),
+            visitor_queue.len(),
+            checking_pool_channels,
+            pool_target,
+            &mut pending_data_channels,
+            &data_ch_req_tx,
+        ) {
+            break;
+        }
+
         tokio::select! {
             val = data_ch_rx.recv() => {
                 match val {
-                    Some(conn) => pool.push_back(PooledTcpDataChannel {
-                        conn,
-                        last_checked: time::Instant::now(),
-                    }),
+                    Some(conn) => {
+                        let _ = pending_data_channels.pop_front();
+                        if visitor_queue.is_empty() && pool.len() >= pool_target {
+                            debug!("Dropping extra TCP data channel after pool is full");
+                        } else {
+                            pool.push_back(PooledTcpDataChannel {
+                                conn,
+                                last_checked: time::Instant::now(),
+                            });
+                        }
+                    },
                     None => break,
                 }
             },
@@ -855,54 +1095,38 @@ async fn run_tcp_connection_pool<T: 'static + Transport>(
                 let Some(visitor) = val else {
                     break;
                 };
-                let mut visitor = Some(visitor);
-
-                loop {
-                    if let Some(mut ch) = next_tcp_pool_channel(
-                        &mut pool,
-                        &mut data_ch_rx,
-                        &data_ch_req_tx,
-                        &heartbeat_cmd,
-                    ).await {
-                        if write_and_flush(&mut ch, &cmd).await.is_ok() {
-                            let v = visitor.take().unwrap();
-                            tokio::spawn(async move {
-                                if let Err(e) = T::forward_tcp(
-                                    ch,
-                                    v,
-                                    post_half_close_idle_timeout,
-                                )
-                                .await
-                                {
-                                    log_forwarder_outcome("tcp", &e);
-                                }
+                visitor_queue.push_back(visitor);
+            },
+            val = checked_ch_rx.recv() => {
+                let Some(result) = val else {
+                    break;
+                };
+                checking_pool_channels = checking_pool_channels.saturating_sub(1);
+                match result {
+                    TcpPoolCheckResult::Healthy(conn) => {
+                        if visitor_queue.is_empty() && pool.len() >= pool_target {
+                            debug!("Dropping healthy TCP data channel after pool is full");
+                        } else {
+                            pool.push_back(PooledTcpDataChannel {
+                                conn,
+                                last_checked: time::Instant::now(),
                             });
-                            break;
                         }
-
-                        // Current data channel is broken. Request for a new one.
-                        if data_ch_req_tx.send(true).is_err() {
-                            if let Some(mut v) = visitor.take() {
-                                let _ = AsyncWriteExt::shutdown(&mut v).await;
-                            }
-                            return Ok(());
-                        }
-                    } else {
-                        if let Some(mut v) = visitor.take() {
-                            let _ = AsyncWriteExt::shutdown(&mut v).await;
-                        }
-                        return Ok(());
                     }
+                    TcpPoolCheckResult::Unhealthy => {}
                 }
             },
             _ = heartbeat_interval.tick() => {
-                refresh_tcp_pool(
+                checking_pool_channels += refresh_tcp_pool(
                     &mut pool,
-                    data_ch_tx.clone(),
-                    &data_ch_req_tx,
+                    checked_ch_tx.clone(),
                     &heartbeat_cmd,
                 )
                 .await;
+            },
+            _ = visitor_cleanup_interval.tick() => {
+                expire_pending_data_channels(&mut pending_data_channels, data_channel_request_timeout);
+                drop_stale_tcp_visitors(&mut visitor_queue, visitor_wait_timeout);
             }
         }
     }
@@ -1084,9 +1308,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_pool_refresh_does_not_block_on_stalled_heartbeat() -> Result<()> {
+    async fn expired_pending_data_channel_requests_are_reissued() -> Result<()> {
         let (data_ch_req_tx, mut data_ch_req_rx) = mpsc::unbounded_channel();
-        let (data_ch_tx, mut data_ch_rx) = mpsc::channel(1);
+        let mut pending = VecDeque::new();
+        pending.push_back(time::Instant::now() - Duration::from_secs(2));
+
+        expire_pending_data_channels(&mut pending, Duration::from_secs(1));
+
+        assert!(pending.is_empty());
+        assert!(ensure_tcp_data_channels(
+            0,
+            1,
+            0,
+            1,
+            &mut pending,
+            &data_ch_req_tx,
+        ));
+        assert_eq!(pending.len(), 2);
+        assert!(matches!(data_ch_req_rx.try_recv(), Ok(true)));
+        assert!(matches!(data_ch_req_rx.try_recv(), Ok(true)));
+        assert!(data_ch_req_rx.try_recv().is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_tcp_visitors_are_closed_when_data_channels_do_not_arrive() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (mut visitor_client, (visitor_server, _)) =
+            tokio::try_join!(TcpStream::connect(addr), listener.accept())?;
+        let mut visitor_queue = VecDeque::new();
+        visitor_queue.push_back(PendingTcpVisitor {
+            stream: visitor_server,
+            accepted_at: time::Instant::now() - Duration::from_secs(2),
+        });
+
+        drop_stale_tcp_visitors(&mut visitor_queue, Duration::from_secs(1));
+
+        assert!(visitor_queue.is_empty());
+        let mut buf = [0u8; 1];
+        let n = time::timeout(Duration::from_secs(1), visitor_client.read(&mut buf)).await??;
+        assert_eq!(n, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_refresh_does_not_block_on_stalled_heartbeat() -> Result<()> {
+        let (checked_ch_tx, mut checked_ch_rx) = mpsc::channel(1);
         let mut pool = VecDeque::new();
         pool.push_back(PooledTcpDataChannel {
             conn: PendingHeartbeatWrite,
@@ -1098,8 +1366,7 @@ mod tests {
             Duration::from_millis(50),
             refresh_tcp_pool_with_timeout(
                 &mut pool,
-                data_ch_tx,
-                &data_ch_req_tx,
+                checked_ch_tx,
                 &bincode::serialize(&DataChannelCmd::HeartBeat).unwrap(),
                 Duration::from_millis(10),
             ),
@@ -1107,18 +1374,16 @@ mod tests {
         .await?;
 
         assert!(pool.is_empty());
-        assert!(data_ch_rx.try_recv().is_err());
         assert!(matches!(
-            time::timeout(Duration::from_secs(1), data_ch_req_rx.recv()).await?,
-            Some(true)
+            time::timeout(Duration::from_secs(1), checked_ch_rx.recv()).await?,
+            Some(TcpPoolCheckResult::Unhealthy)
         ));
         Ok(())
     }
 
     #[tokio::test]
     async fn tcp_pool_refresh_scans_fresh_channels_once() -> Result<()> {
-        let (data_ch_req_tx, mut data_ch_req_rx) = mpsc::unbounded_channel();
-        let (data_ch_tx, mut data_ch_rx) = mpsc::channel(1);
+        let (checked_ch_tx, mut checked_ch_rx) = mpsc::channel(1);
         let mut pool = VecDeque::new();
         let (server_side_1, _client_side_1) = duplex(64);
         let (server_side_2, _client_side_2) = duplex(64);
@@ -1136,8 +1401,7 @@ mod tests {
             Duration::from_millis(50),
             refresh_tcp_pool_with_timeout(
                 &mut pool,
-                data_ch_tx,
-                &data_ch_req_tx,
+                checked_ch_tx,
                 &bincode::serialize(&DataChannelCmd::HeartBeat).unwrap(),
                 Duration::from_millis(10),
             ),
@@ -1145,8 +1409,7 @@ mod tests {
         .await?;
 
         assert_eq!(pool.len(), 2);
-        assert!(data_ch_req_rx.try_recv().is_err());
-        assert!(data_ch_rx.try_recv().is_err());
+        assert!(checked_ch_rx.try_recv().is_err());
         Ok(())
     }
 }
