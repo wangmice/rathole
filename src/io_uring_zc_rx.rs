@@ -70,11 +70,11 @@ impl MaybeZcRxTcpStream {
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn try_into_tcp_stream(self) -> Result<TcpStream, Self> {
+    pub(crate) fn try_into_tcp_stream(self) -> Option<TcpStream> {
         if self.rx.is_none() {
-            Ok(self.inner)
+            Some(self.inner)
         } else {
-            Err(self)
+            None
         }
     }
 }
@@ -243,8 +243,7 @@ mod sys {
             let mut state = match self.state.lock() {
                 Ok(state) => state,
                 Err(_) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
+                    return Poll::Ready(Err(io::Error::other(
                         "io_uring ZC Rx reader state is poisoned",
                     )));
                 }
@@ -585,9 +584,8 @@ mod sys {
             }
 
             Ok(Self {
-                ptr: NonNull::new(ptr.cast()).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::Other, "mmap returned a null pointer")
-                })?,
+                ptr: NonNull::new(ptr.cast())
+                    .ok_or_else(|| io::Error::other("mmap returned a null pointer"))?,
                 len,
             })
         }

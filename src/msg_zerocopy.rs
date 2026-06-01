@@ -349,7 +349,7 @@ mod linux {
         fn lock(&self) -> io::Result<std::sync::MutexGuard<'_, PendingState>> {
             self.pending
                 .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "MSG_ZEROCOPY state poisoned"))
+                .map_err(|_| io::Error::other("MSG_ZEROCOPY state poisoned"))
         }
     }
 

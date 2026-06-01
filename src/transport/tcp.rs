@@ -116,10 +116,7 @@ async fn forward_tcp(
 
 #[cfg(target_os = "linux")]
 fn into_tcp_stream(stream: MaybeZcRxTcpStream) -> io::Result<TcpStream> {
-    stream.try_into_tcp_stream().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            "io_uring ZC Rx stream cannot be converted back to TcpStream",
-        )
+    stream.try_into_tcp_stream().ok_or_else(|| {
+        io::Error::other("io_uring ZC Rx stream cannot be converted back to TcpStream")
     })
 }
