@@ -1,17 +1,19 @@
-use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
+use crate::config::{
+    Config, ServerConfig, ServerServiceConfig, ServerServiceMode, ServiceType, TransportType,
+};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
-use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
+use crate::constants::{UDP_BUFFER_SIZE, listen_backoff};
 use crate::helper::{retry_notify_with_deadline, write_and_flush};
 use crate::multi_map::MultiMap;
-use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
+use crate::protocol::Hello::{ControlChannelHello, DataChannelHello, VisitorChannelHello};
 use crate::protocol::{
-    self, read_ack, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello,
-    UdpTraffic, HASH_WIDTH_IN_BYTES,
+    self, Ack, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES, Hello, UdpTraffic, read_ack,
+    read_auth, read_hello,
 };
 use crate::transport::{SocketOpts, TcpTransport, Transport};
-use anyhow::{anyhow, bail, Context, Result};
-use backoff::backoff::Backoff;
+use anyhow::{Context, Result, anyhow, bail};
 use backoff::ExponentialBackoff;
+use backoff::backoff::Backoff;
 
 use rand::RngExt as _;
 use std::collections::{HashMap, VecDeque};
@@ -19,9 +21,9 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time;
-use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
+use tracing::{Instrument, Span, debug, error, info, info_span, instrument, warn};
 
 #[cfg(feature = "noise")]
 use crate::transport::NoiseTransport;
@@ -47,6 +49,10 @@ const TCP_VISITOR_WAIT_TIMEOUT: u64 = 1;
 const TCP_DATA_CHANNEL_REQUEST_TIMEOUT: u64 = 15; // Max time a data-channel request may remain pending
 #[cfg(test)]
 const TCP_DATA_CHANNEL_REQUEST_TIMEOUT: u64 = 1;
+#[cfg(not(test))]
+const STCP_DATA_CHANNEL_WAIT_TIMEOUT: u64 = 15;
+#[cfg(test)]
+const STCP_DATA_CHANNEL_WAIT_TIMEOUT: u64 = 1;
 
 // Surface the outcome of a forwarder task. Only the leak-guard reaper
 // (the typed `PostHalfCloseIdleTimeout` sentinel) is debug-level; generic
@@ -70,11 +76,13 @@ pub async fn run_server(
     update_rx: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
     let config = match config.server {
-            Some(config) => config,
-            None => {
-                return Err(anyhow!("Try to run as a server, but the configuration is missing. Please add the `[server]` block"))
-            }
-        };
+        Some(config) => config,
+        None => {
+            return Err(anyhow!(
+                "Try to run as a server, but the configuration is missing. Please add the `[server]` block"
+            ));
+        }
+    };
 
     match config.transport.transport_type {
         TransportType::Tcp => {
@@ -318,6 +326,16 @@ async fn handle_connection<T: 'static + Transport>(
         DataChannelHello(_, nonce) => {
             do_data_channel_handshake(conn, control_channels, nonce).await?;
         }
+        VisitorChannelHello(_, service_digest) => {
+            do_visitor_channel_handshake(
+                conn,
+                services,
+                control_channels,
+                service_digest,
+                server_config,
+            )
+            .await?;
+        }
     }
     Ok(())
 }
@@ -439,10 +457,97 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
     Ok(())
 }
 
+async fn do_visitor_channel_handshake<T: 'static + Transport>(
+    mut conn: T::Stream,
+    services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
+    control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+    service_digest: ServiceDigest,
+    _server_config: Arc<ServerConfig>,
+) -> Result<()> {
+    info!("Try to handshake a visitor channel");
+
+    let mut nonce = vec![0u8; HASH_WIDTH_IN_BYTES];
+    rand::rng().fill(&mut nonce);
+
+    let hello_send = Hello::ControlChannelHello(
+        protocol::CURRENT_PROTO_VERSION,
+        nonce.clone().try_into().unwrap(),
+    );
+    conn.write_all(&protocol::encode(&hello_send).unwrap())
+        .await?;
+    conn.flush().await?;
+
+    let service_config = match services.read().await.get(&service_digest) {
+        Some(v) => v.to_owned(),
+        None => {
+            conn.write_all(&protocol::encode(&Ack::ServiceNotExist).unwrap())
+                .await?;
+            bail!("No such a service {}", hex::encode(service_digest));
+        }
+    };
+
+    if service_config.mode != ServerServiceMode::Stcp
+        || service_config.service_type != ServiceType::Tcp
+    {
+        conn.write_all(&protocol::encode(&Ack::Unsupported).unwrap())
+            .await?;
+        bail!("Service {} is not a tcp stcp service", service_config.name);
+    }
+
+    T::hint(&conn, SocketOpts::from_server_cfg(&service_config));
+
+    let mut concat = Vec::from(service_config.token.as_ref().unwrap().as_bytes());
+    concat.append(&mut nonce);
+
+    let protocol::Auth(d) = read_auth(&mut conn).await?;
+    let expected = protocol::digest(&concat);
+    if expected != d {
+        conn.write_all(&protocol::encode(&Ack::AuthFailed).unwrap())
+            .await?;
+        debug!(
+            "Expect {}, but got {}",
+            hex::encode(expected),
+            hex::encode(d)
+        );
+        bail!(
+            "Visitor for service {} failed the authentication",
+            service_config.name
+        );
+    }
+
+    let stcp_visitor_tx = {
+        let control_channels_guard = control_channels.read().await;
+        match control_channels_guard.get1(&service_digest) {
+            Some(handle) => handle.stcp_visitor_tx.clone(),
+            None => None,
+        }
+    };
+
+    let Some(stcp_visitor_tx) = stcp_visitor_tx else {
+        conn.write_all(&protocol::encode(&Ack::NoClient).unwrap())
+            .await?;
+        bail!(
+            "No client available for stcp service {}",
+            service_config.name
+        );
+    };
+
+    conn.write_all(&protocol::encode(&Ack::Ok).unwrap()).await?;
+    conn.flush().await?;
+
+    stcp_visitor_tx
+        .send(conn)
+        .await
+        .with_context(|| "stcp visitor channel for a stale control channel")?;
+
+    Ok(())
+}
+
 pub struct ControlChannelHandle<T: Transport> {
     // Shutdown the control channel by dropping it
     _shutdown_tx: broadcast::Sender<bool>,
     data_ch_tx: mpsc::Sender<T::Stream>,
+    stcp_visitor_tx: Option<mpsc::Sender<T::Stream>>,
     service: ServerServiceConfig,
 }
 
@@ -472,27 +577,31 @@ where
         let (data_ch_req_tx, data_ch_req_rx) = mpsc::unbounded_channel();
 
         let shutdown_rx_clone = shutdown_tx.subscribe();
-        let bind_addr = service.bind_addr.clone();
-        match service.service_type {
-            ServiceType::Tcp => tokio::spawn(
-                async move {
-                    if let Err(e) = run_tcp_connection_pool::<T>(
-                        bind_addr,
-                        post_half_close_idle_timeout,
-                        data_ch_rx,
-                        data_ch_req_tx,
-                        TCP_POOL_SIZE,
-                        shutdown_rx_clone,
-                    )
-                    .await
-                    .with_context(|| "Failed to run TCP connection pool")
-                    {
-                        error!("{:#}", e);
+        let stcp_visitor_tx = match (service.mode, service.service_type) {
+            (ServerServiceMode::Public, ServiceType::Tcp) => {
+                let bind_addr = service.bind_addr.clone();
+                tokio::spawn(
+                    async move {
+                        if let Err(e) = run_tcp_connection_pool::<T>(
+                            bind_addr,
+                            post_half_close_idle_timeout,
+                            data_ch_rx,
+                            data_ch_req_tx,
+                            TCP_POOL_SIZE,
+                            shutdown_rx_clone,
+                        )
+                        .await
+                        .with_context(|| "Failed to run TCP connection pool")
+                        {
+                            error!("{:#}", e);
+                        }
                     }
-                }
-                .instrument(Span::current()),
-            ),
-            ServiceType::Udp => {
+                    .instrument(Span::current()),
+                );
+                None
+            }
+            (ServerServiceMode::Public, ServiceType::Udp) => {
+                let bind_addr = service.bind_addr.clone();
                 for _i in 0..UDP_POOL_SIZE {
                     if let Err(e) = data_ch_req_tx.send(true) {
                         error!("Failed to request data channel {}", e);
@@ -508,13 +617,38 @@ where
                             shutdown_rx_clone,
                         )
                         .await
-                        .with_context(|| "Failed to run TCP connection pool")
+                        .with_context(|| "Failed to run UDP connection pool")
                         {
                             error!("{:#}", e);
                         }
                     }
                     .instrument(Span::current()),
-                )
+                );
+                None
+            }
+            (ServerServiceMode::Stcp, ServiceType::Tcp) => {
+                let (stcp_visitor_tx, stcp_visitor_rx) = mpsc::channel(CHAN_SIZE);
+                tokio::spawn(
+                    async move {
+                        if let Err(e) = run_stcp_connection_pool::<T>(
+                            post_half_close_idle_timeout,
+                            data_ch_rx,
+                            data_ch_req_tx,
+                            stcp_visitor_rx,
+                            shutdown_rx_clone,
+                        )
+                        .await
+                        .with_context(|| "Failed to run STCP connection pool")
+                        {
+                            error!("{:#}", e);
+                        }
+                    }
+                    .instrument(Span::current()),
+                );
+                Some(stcp_visitor_tx)
+            }
+            (ServerServiceMode::Stcp, ServiceType::Udp) => {
+                unreachable!("stcp udp services are rejected during configuration validation")
             }
         };
 
@@ -555,6 +689,7 @@ where
         ControlChannelHandle {
             _shutdown_tx: shutdown_tx,
             data_ch_tx,
+            stcp_visitor_tx,
             service,
         }
     }
@@ -1147,6 +1282,74 @@ async fn run_tcp_connection_pool<T: 'static + Transport>(
 }
 
 #[instrument(skip_all)]
+async fn run_stcp_connection_pool<T: 'static + Transport>(
+    post_half_close_idle_timeout: Option<Duration>,
+    mut data_ch_rx: mpsc::Receiver<T::Stream>,
+    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    mut stcp_visitor_rx: mpsc::Receiver<T::Stream>,
+    mut shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
+    let cmd = protocol::encode(&DataChannelCmd::StartForwardTcp).unwrap();
+    let wait_timeout = Duration::from_secs(STCP_DATA_CHANNEL_WAIT_TIMEOUT);
+
+    loop {
+        tokio::select! {
+            visitor = stcp_visitor_rx.recv() => {
+                let Some(visitor) = visitor else {
+                    break;
+                };
+
+                if data_ch_req_tx.send(true).is_err() {
+                    break;
+                }
+
+                let data_channel = time::timeout(wait_timeout, data_ch_rx.recv()).await;
+                let Some(mut data_channel) = data_channel
+                    .ok()
+                    .flatten()
+                else {
+                    warn!("Dropped stcp visitor because no data channel arrived in time");
+                    continue;
+                };
+
+                match time::timeout(
+                    Duration::from_secs(TCP_DATA_CHANNEL_REQUEST_TIMEOUT),
+                    write_and_flush(&mut data_channel, &cmd),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        tokio::spawn(async move {
+                            if let Err(e) = crate::forward::forward_bidirectional_with_idle_timeout(
+                                data_channel,
+                                visitor,
+                                post_half_close_idle_timeout,
+                            )
+                            .await
+                            {
+                                log_forwarder_outcome("stcp", &e);
+                            }
+                        });
+                    }
+                    Ok(Err(e)) => {
+                        debug!("Dropping stcp data channel that rejected start command: {:#}", e);
+                    }
+                    Err(_) => {
+                        debug!("Dropping stcp data channel that timed out on start command");
+                    }
+                }
+            }
+            _ = shutdown_rx.recv() => {
+                break;
+            }
+        }
+    }
+
+    info!("STCP pool dropped");
+    Ok(())
+}
+
+#[instrument(skip_all)]
 async fn run_udp_connection_pool<T: Transport>(
     bind_addr: String,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
@@ -1208,8 +1411,8 @@ mod tests {
     use super::*;
     use std::pin::Pin;
     use std::task::{Context, Poll};
-    use tokio::io::duplex;
     use tokio::io::ReadBuf;
+    use tokio::io::duplex;
 
     #[derive(Debug)]
     struct PendingHeartbeatWrite;

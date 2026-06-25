@@ -1,25 +1,27 @@
-use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType};
+use crate::config::{
+    ClientConfig, ClientServiceConfig, ClientVisitorConfig, Config, ServiceType, TransportType,
+};
 use crate::config_watcher::{ClientServiceChange, ConfigChange};
 use crate::helper::udp_connect;
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
-    self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ControlChannelCmd,
-    DataChannelCmd, UdpTraffic, CURRENT_PROTO_VERSION, HASH_WIDTH_IN_BYTES,
+    self, Ack, Auth, CURRENT_PROTO_VERSION, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES,
+    UdpTraffic, read_ack, read_control_cmd, read_data_cmd, read_hello,
 };
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
+use backoff::ExponentialBackoff;
 use backoff::backoff::Backoff;
 use backoff::future::retry_notify;
-use backoff::ExponentialBackoff;
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use tokio::time::{self, Duration, Instant};
-use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
+use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
 
 #[cfg(feature = "noise")]
 use crate::transport::NoiseTransport;
@@ -28,7 +30,7 @@ use crate::transport::TlsTransport;
 #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
 use crate::transport::WebsocketTransport;
 
-use crate::constants::{run_control_chan_backoff, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT};
+use crate::constants::{UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT, run_control_chan_backoff};
 
 #[cfg(not(test))]
 const DATA_CHANNEL_HANDSHAKE_TIMEOUT: u64 = 15;
@@ -104,6 +106,7 @@ fn log_forwarder_outcome(kind: &'static str, e: &io::Error) {
 struct Client<T: Transport> {
     config: ClientConfig,
     service_handles: HashMap<String, ControlChannelHandle>,
+    visitor_handles: HashMap<String, VisitorHandle>,
     transport: Arc<T>,
 }
 
@@ -115,6 +118,7 @@ impl<T: 'static + Transport> Client<T> {
         Ok(Client {
             config,
             service_handles: HashMap::new(),
+            visitor_handles: HashMap::new(),
             transport,
         })
     }
@@ -135,6 +139,16 @@ impl<T: 'static + Transport> Client<T> {
                 self.config.post_half_close_idle_timeout.as_duration(),
             );
             self.service_handles.insert(name.clone(), handle);
+        }
+
+        for (name, config) in &self.config.visitors {
+            let handle = VisitorHandle::new(
+                (*config).clone(),
+                self.config.remote_addr.clone(),
+                self.transport.clone(),
+                self.config.post_half_close_idle_timeout.as_duration(),
+            );
+            self.visitor_handles.insert(name.clone(), handle);
         }
 
         // Wait for the shutdown signal
@@ -161,6 +175,9 @@ impl<T: 'static + Transport> Client<T> {
         for (_, handle) in self.service_handles.drain() {
             handle.shutdown();
         }
+        for (_, handle) in self.visitor_handles.drain() {
+            handle.shutdown();
+        }
 
         Ok(())
     }
@@ -181,6 +198,19 @@ impl<T: 'static + Transport> Client<T> {
                 }
                 ClientServiceChange::Delete(s) => {
                     let _ = self.service_handles.remove(&s);
+                }
+                ClientServiceChange::AddVisitor(cfg) => {
+                    let name = cfg.name.clone();
+                    let handle = VisitorHandle::new(
+                        cfg,
+                        self.config.remote_addr.clone(),
+                        self.transport.clone(),
+                        self.config.post_half_close_idle_timeout.as_duration(),
+                    );
+                    let _ = self.visitor_handles.insert(name, handle);
+                }
+                ClientServiceChange::DeleteVisitor(s) => {
+                    let _ = self.visitor_handles.remove(&s);
                 }
             },
             ignored => warn!("Ignored {:?} since running as a client", ignored),
@@ -315,6 +345,180 @@ async fn run_data_channel_for_tcp<T: Transport>(
         log_forwarder_outcome("tcp", &e);
     }
     Ok(())
+}
+
+struct RunVisitorConnectionArgs<T: Transport> {
+    service_digest: ServiceDigest,
+    remote_addr: AddrMaybeCached,
+    connector: Arc<T>,
+    socket_opts: SocketOpts,
+    visitor: ClientVisitorConfig,
+    post_half_close_idle_timeout: Option<Duration>,
+}
+
+async fn run_visitor_connection<T: Transport>(
+    local: TcpStream,
+    args: Arc<RunVisitorConnectionArgs<T>>,
+) -> Result<()> {
+    let mut conn = args
+        .connector
+        .connect(&args.remote_addr)
+        .await
+        .with_context(|| format!("Failed to connect to {}", &args.remote_addr))?;
+    T::hint(&conn, args.socket_opts);
+
+    let hello = Hello::VisitorChannelHello(
+        CURRENT_PROTO_VERSION,
+        args.service_digest[..].try_into().unwrap(),
+    );
+    conn.write_all(&protocol::encode(&hello).unwrap()).await?;
+    conn.flush().await?;
+
+    let nonce = match read_hello(&mut conn).await? {
+        ControlChannelHello(_, d) => d,
+        _ => bail!("Unexpected type of hello"),
+    };
+
+    let mut concat = Vec::from(args.visitor.token.as_ref().unwrap().as_bytes());
+    concat.extend_from_slice(&nonce);
+    let auth = Auth(protocol::digest(&concat));
+    conn.write_all(&protocol::encode(&auth).unwrap()).await?;
+    conn.flush().await?;
+
+    match read_ack(&mut conn).await? {
+        Ack::Ok => {}
+        v => {
+            return Err(anyhow!("{}", v))
+                .with_context(|| format!("Visitor authentication failed: {}", args.visitor.name));
+        }
+    }
+
+    if let Err(e) = T::forward_tcp(conn, local, args.post_half_close_idle_timeout).await {
+        log_forwarder_outcome("stcp visitor", &e);
+    }
+    Ok(())
+}
+
+struct Visitor<T: Transport> {
+    digest: ServiceDigest,
+    visitor: ClientVisitorConfig,
+    shutdown_rx: oneshot::Receiver<u8>,
+    remote_addr: String,
+    transport: Arc<T>,
+    post_half_close_idle_timeout: Option<Duration>,
+}
+
+struct VisitorHandle {
+    shutdown_tx: oneshot::Sender<u8>,
+}
+
+impl<T: 'static + Transport> Visitor<T> {
+    #[instrument(skip_all, fields(visitor = %self.visitor.name))]
+    async fn run(&mut self) -> Result<()> {
+        let l = TcpListener::bind(&self.visitor.bind_addr)
+            .await
+            .with_context(|| format!("Failed to listen at {}", self.visitor.bind_addr))?;
+        info!("Visitor listening at {}", self.visitor.bind_addr);
+
+        let mut remote_addr = AddrMaybeCached::new(&self.remote_addr);
+        remote_addr.resolve().await?;
+
+        let socket_opts = SocketOpts::from_client_visitor_cfg(&self.visitor);
+        let args = Arc::new(RunVisitorConnectionArgs {
+            service_digest: self.digest,
+            remote_addr,
+            connector: self.transport.clone(),
+            socket_opts,
+            visitor: self.visitor.clone(),
+            post_half_close_idle_timeout: self.post_half_close_idle_timeout,
+        });
+
+        loop {
+            tokio::select! {
+                val = l.accept() => {
+                    let (local, addr) = val.with_context(|| "Failed to accept visitor connection")?;
+                    debug!("New local visitor from {}", addr);
+                    if let Some(nodelay) = self.visitor.nodelay {
+                        if let Err(e) = local.set_nodelay(nodelay) {
+                            warn!("Failed to set visitor TCP_NODELAY: {}", e);
+                        }
+                    }
+                    let args = args.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = run_visitor_connection(local, args)
+                            .await
+                            .with_context(|| "Failed to run visitor connection")
+                        {
+                            warn!("{:#}", e);
+                        }
+                    }.instrument(Span::current()));
+                }
+                _ = &mut self.shutdown_rx => {
+                    break;
+                }
+            }
+        }
+
+        info!("Visitor shutdown");
+        Ok(())
+    }
+}
+
+impl VisitorHandle {
+    #[instrument(name = "visitor_handle", skip_all, fields(visitor = %visitor.name))]
+    fn new<T: 'static + Transport>(
+        visitor: ClientVisitorConfig,
+        remote_addr: String,
+        transport: Arc<T>,
+        post_half_close_idle_timeout: Option<Duration>,
+    ) -> VisitorHandle {
+        let digest = protocol::digest(visitor.name.as_bytes());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mut retry_backoff = run_control_chan_backoff(visitor.retry_interval.unwrap());
+        let mut visitor = Visitor {
+            digest,
+            visitor,
+            shutdown_rx,
+            remote_addr,
+            transport,
+            post_half_close_idle_timeout,
+        };
+
+        tokio::spawn(
+            async move {
+                let mut start = Instant::now();
+                while let Err(err) = visitor
+                    .run()
+                    .await
+                    .with_context(|| "Failed to run the visitor")
+                {
+                    if visitor.shutdown_rx.try_recv() != Err(oneshot::error::TryRecvError::Empty) {
+                        break;
+                    }
+
+                    if start.elapsed() > Duration::from_secs(3) {
+                        retry_backoff.reset();
+                    }
+
+                    if let Some(duration) = retry_backoff.next_backoff() {
+                        error!("{:#}. Retry in {:?}...", err, duration);
+                        time::sleep(duration).await;
+                    } else {
+                        panic!("{:#}. Break", err);
+                    }
+
+                    start = Instant::now();
+                }
+            }
+            .instrument(Span::current()),
+        );
+
+        VisitorHandle { shutdown_tx }
+    }
+
+    fn shutdown(self) {
+        let _ = self.shutdown_tx.send(0u8);
+    }
 }
 
 // Things get a little tricker when it gets to UDP because it's connection-less.

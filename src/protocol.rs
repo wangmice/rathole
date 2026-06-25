@@ -1,9 +1,9 @@
 pub const HASH_WIDTH_IN_BYTES: usize = 32;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::{Bytes, BytesMut};
 use lazy_static::lazy_static;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::trace;
@@ -39,6 +39,7 @@ fn encoded_size<T: Serialize>(
 pub enum Hello {
     ControlChannelHello(ProtocolVersion, Digest), // sha256sum(service name) or a nonce
     DataChannelHello(ProtocolVersion, Digest),    // token provided by CreateDataChannel
+    VisitorChannelHello(ProtocolVersion, Digest), // sha256sum(service name)
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -49,6 +50,8 @@ pub enum Ack {
     Ok,
     ServiceNotExist,
     AuthFailed,
+    NoClient,
+    Unsupported,
 }
 
 impl std::fmt::Display for Ack {
@@ -60,6 +63,8 @@ impl std::fmt::Display for Ack {
                 Ack::Ok => "Ok",
                 Ack::ServiceNotExist => "Service not exist",
                 Ack::AuthFailed => "Incorrect token",
+                Ack::NoClient => "No client available",
+                Ack::Unsupported => "Unsupported",
             }
         )
     }
@@ -210,6 +215,15 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resu
             }
         }
         Hello::DataChannelHello(v, _) => {
+            if v != CURRENT_PROTO_VERSION {
+                bail!(
+                    "Protocol version mismatched. Expected {}, got {}. Please update `rathole`.",
+                    CURRENT_PROTO_VERSION,
+                    v
+                );
+            }
+        }
+        Hello::VisitorChannelHello(v, _) => {
             if v != CURRENT_PROTO_VERSION {
                 bail!(
                     "Protocol version mismatched. Expected {}, got {}. Please update `rathole`.",

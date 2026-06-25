@@ -1,4 +1,6 @@
-use crate::config::{ClientServiceConfig, ServerServiceConfig, TcpConfig, TransportConfig};
+use crate::config::{
+    ClientServiceConfig, ClientVisitorConfig, ServerServiceConfig, TcpConfig, TransportConfig,
+};
 use crate::helper::{to_socket_addr, try_set_tcp_keepalive};
 use anyhow::{Context, Result};
 use std::fmt::{Debug, Display};
@@ -64,7 +66,7 @@ pub trait Transport: Debug + Send + Sync {
     /// accept must be cancel safe
     async fn accept(&self, a: &Self::Acceptor) -> Result<(Self::RawStream, SocketAddr)>;
     fn handshake(&self, conn: Self::RawStream)
-        -> impl Future<Output = Result<Self::Stream>> + Send;
+    -> impl Future<Output = Result<Self::Stream>> + Send;
     fn connect(&self, addr: &AddrMaybeCached) -> impl Future<Output = Result<Self::Stream>> + Send;
     fn forward_tcp(
         data_channel: Self::Stream,
@@ -184,6 +186,13 @@ impl SocketOpts {
     }
 
     pub fn from_client_cfg(cfg: &ClientServiceConfig) -> SocketOpts {
+        SocketOpts {
+            nodelay: cfg.nodelay,
+            ..SocketOpts::none()
+        }
+    }
+
+    pub fn from_client_visitor_cfg(cfg: &ClientVisitorConfig) -> SocketOpts {
         SocketOpts {
             nodelay: cfg.nodelay,
             ..SocketOpts::none()

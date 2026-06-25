@@ -1,5 +1,5 @@
 use anyhow::{Ok, Result};
-use common::{run_rathole_client, PING, PONG};
+use common::{PING, PONG, run_rathole_client};
 use rand::RngExt as _;
 use std::time::Duration;
 use tokio::{
@@ -19,6 +19,10 @@ const ECHO_SERVER_ADDR: &str = "127.0.0.1:8080";
 const PINGPONG_SERVER_ADDR: &str = "127.0.0.1:8081";
 const ECHO_SERVER_ADDR_EXPOSED: &str = "127.0.0.1:2334";
 const PINGPONG_SERVER_ADDR_EXPOSED: &str = "127.0.0.1:2335";
+const STCP_ECHO_SERVER_ADDR: &str = "127.0.0.1:8082";
+const STCP_PINGPONG_SERVER_ADDR: &str = "127.0.0.1:8083";
+const STCP_ECHO_VISITOR_ADDR: &str = "127.0.0.1:2344";
+const STCP_PINGPONG_VISITOR_ADDR: &str = "127.0.0.1:2345";
 const HITTER_NUM: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
@@ -115,6 +119,65 @@ async fn udp() -> Result<()> {
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
     test("tests/for_udp/websocket_tls_transport.toml", Type::Udp).await?;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn stcp() -> Result<()> {
+    init();
+    if cfg!(not(all(feature = "client", feature = "server"))) {
+        return Ok(());
+    }
+
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(STCP_ECHO_SERVER_ADDR).await {
+            panic!("Failed to run the stcp echo server for testing: {:?}", e);
+        }
+    });
+
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::pingpong_server(STCP_PINGPONG_SERVER_ADDR).await {
+            panic!(
+                "Failed to run the stcp pingpong server for testing: {:?}",
+                e
+            );
+        }
+    });
+
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let (provider_shutdown_tx, provider_shutdown_rx) = broadcast::channel(1);
+    let (visitor_shutdown_tx, visitor_shutdown_rx) = broadcast::channel(1);
+
+    let server = tokio::spawn(async move {
+        run_rathole_server("tests/for_stcp/server.toml", server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    time::sleep(Duration::from_millis(250)).await;
+
+    let provider = tokio::spawn(async move {
+        run_rathole_client("tests/for_stcp/provider.toml", provider_shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    let visitor = tokio::spawn(async move {
+        run_rathole_client("tests/for_stcp/visitor.toml", visitor_shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    time::sleep(Duration::from_millis(2500)).await;
+
+    tcp_echo_hitter(STCP_ECHO_VISITOR_ADDR).await?;
+    tcp_pingpong_hitter(STCP_PINGPONG_VISITOR_ADDR).await?;
+
+    server_shutdown_tx.send(true)?;
+    provider_shutdown_tx.send(true)?;
+    visitor_shutdown_tx.send(true)?;
+
+    let _ = tokio::join!(server, provider, visitor);
     Ok(())
 }
 

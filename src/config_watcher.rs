@@ -1,6 +1,8 @@
 use crate::{
-    config::{ClientConfig, ClientServiceConfig, ServerConfig, ServerServiceConfig},
     Config,
+    config::{
+        ClientConfig, ClientServiceConfig, ClientVisitorConfig, ServerConfig, ServerServiceConfig,
+    },
 };
 #[cfg(feature = "notify")]
 use anyhow::Context;
@@ -30,6 +32,8 @@ pub enum ConfigChange {
 pub enum ClientServiceChange {
     Add(ClientServiceConfig),
     Delete(String),
+    AddVisitor(ClientVisitorConfig),
+    DeleteVisitor(String),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -77,11 +81,13 @@ impl InstanceConfig for ClientConfig {
     fn equal_without_service(&self, rhs: &Self) -> bool {
         let left = ClientConfig {
             services: Default::default(),
+            visitors: Default::default(),
             ..self.clone()
         };
 
         let right = ClientConfig {
             services: Default::default(),
+            visitors: Default::default(),
             ..rhs.clone()
         };
 
@@ -96,6 +102,22 @@ impl InstanceConfig for ClientConfig {
     fn get_services(&self) -> &HashMap<String, Self::ServiceConfig> {
         &self.services
     }
+}
+
+fn calculate_client_visitor_events(old: &ClientConfig, new: &ClientConfig) -> Vec<ConfigChange> {
+    let deletions = old
+        .visitors
+        .keys()
+        .filter(|&name| new.visitors.get(name).is_none())
+        .map(|x| ConfigChange::ClientChange(ClientServiceChange::DeleteVisitor(x.to_owned())));
+
+    let additions = new
+        .visitors
+        .iter()
+        .filter(|(name, c)| old.visitors.get(*name) != Some(*c))
+        .map(|(_, c)| ConfigChange::ClientChange(ClientServiceChange::AddVisitor(c.clone())));
+
+    deletions.chain(additions).collect()
 }
 
 pub struct ConfigWatcherHandle {
@@ -264,13 +286,13 @@ fn calculate_events(old: &Config, new: &Config) -> Option<Vec<ConfigChange>> {
     }
 
     if old.client != new.client {
-        match calculate_instance_config_events(
-            old.client.as_ref().unwrap(),
-            new.client.as_ref().unwrap(),
-        ) {
+        let old_client = old.client.as_ref().unwrap();
+        let new_client = new.client.as_ref().unwrap();
+        match calculate_instance_config_events(old_client, new_client) {
             Some(mut v) => ret.append(&mut v),
             None => return Some(vec![ConfigChange::General(Box::new(new.clone()))]),
         }
+        ret.append(&mut calculate_client_visitor_events(old_client, new_client));
     }
 
     Some(ret)
@@ -306,7 +328,7 @@ mod test {
     use crate::config::ServerConfig;
 
     use super::*;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     // macro to create map or set literal
     macro_rules! collection {
@@ -442,6 +464,8 @@ mod test {
                     ConfigChange::ClientChange(sc) => match sc {
                         ClientServiceChange::Add(c) => "c_add_".to_owned() + &c.name,
                         ClientServiceChange::Delete(s) => "c_del_".to_owned() + s,
+                        ClientServiceChange::AddVisitor(c) => "c_visitor_add_".to_owned() + &c.name,
+                        ClientServiceChange::DeleteVisitor(s) => "c_visitor_del_".to_owned() + s,
                     },
                 }
             };
@@ -480,9 +504,11 @@ mod test {
             shutdown_rx,
         ));
 
-        assert!(timeout(Duration::from_millis(50), event_rx.recv())
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(50), event_rx.recv())
+                .await
+                .is_err()
+        );
 
         let _ = shutdown_tx.send(true);
         task.await.unwrap();

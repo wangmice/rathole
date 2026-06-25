@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -84,6 +84,26 @@ impl ClientServiceConfig {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ClientVisitorConfig {
+    #[serde(skip)]
+    pub name: String,
+    pub bind_addr: String,
+    pub token: Option<MaskedString>,
+    pub nodelay: Option<bool>,
+    pub retry_interval: Option<u64>,
+}
+
+impl ClientVisitorConfig {
+    pub fn with_name(name: &str) -> ClientVisitorConfig {
+        ClientVisitorConfig {
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ServiceType {
     #[serde(rename = "tcp")]
@@ -97,6 +117,19 @@ fn default_service_type() -> ServiceType {
     Default::default()
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ServerServiceMode {
+    #[serde(rename = "public")]
+    #[default]
+    Public,
+    #[serde(rename = "stcp")]
+    Stcp,
+}
+
+fn default_server_service_mode() -> ServerServiceMode {
+    Default::default()
+}
+
 /// Per service config
 /// All Option are optional in configuration but must be Some value in runtime
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
@@ -104,8 +137,11 @@ fn default_service_type() -> ServiceType {
 pub struct ServerServiceConfig {
     #[serde(rename = "type", default = "default_service_type")]
     pub service_type: ServiceType,
+    #[serde(default = "default_server_service_mode")]
+    pub mode: ServerServiceMode,
     #[serde(skip)]
     pub name: String,
+    #[serde(default)]
     pub bind_addr: String,
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
@@ -329,6 +365,9 @@ pub struct ClientConfig {
     pub remote_addr: String,
     pub default_token: Option<MaskedString>,
     pub prefer_ipv6: Option<bool>,
+    #[serde(default)]
+    pub visitors: HashMap<String, ClientVisitorConfig>,
+    #[serde(default)]
     pub services: HashMap<String, ClientServiceConfig>,
     #[serde(default)]
     pub transport: TransportConfig,
@@ -394,6 +433,12 @@ impl Config {
                     bail!("The token of service {} is not set", name);
                 }
             }
+            if s.mode == ServerServiceMode::Public && s.bind_addr.is_empty() {
+                bail!("The bind_addr of service {} is not set", name);
+            }
+            if s.mode == ServerServiceMode::Stcp && s.service_type != ServiceType::Tcp {
+                bail!("stcp service {} only supports tcp", name);
+            }
         }
 
         Config::validate_transport_config(&server.transport, true)?;
@@ -416,6 +461,19 @@ impl Config {
             }
         }
 
+        for (name, v) in &mut client.visitors {
+            v.name = name.clone();
+            if v.token.is_none() {
+                v.token = client.default_token.clone();
+                if v.token.is_none() {
+                    bail!("The token of visitor {} is not set", name);
+                }
+            }
+            if v.retry_interval.is_none() {
+                v.retry_interval = Some(client.retry_interval);
+            }
+        }
+
         Config::validate_transport_config(&client.transport, false)?;
 
         Ok(())
@@ -425,7 +483,9 @@ impl Config {
         let zc_rx = &config.io_uring_zc_rx;
         if zc_rx.enabled {
             if zc_rx.interface.is_some() && zc_rx.interface_index.is_some() {
-                bail!("`io_uring_zc_rx.interface` and `io_uring_zc_rx.interface_index` are mutually exclusive");
+                bail!(
+                    "`io_uring_zc_rx.interface` and `io_uring_zc_rx.interface_index` are mutually exclusive"
+                );
             }
             if zc_rx.interface.as_ref().is_some_and(|s| s.is_empty()) {
                 bail!("`io_uring_zc_rx.interface` must not be empty");
@@ -487,9 +547,9 @@ impl Config {
         let s: String = fs::read_to_string(path)
             .await
             .with_context(|| format!("Failed to read the config {:?}", path))?;
-        Config::from_str(&s).with_context(|| {
-            "Configuration is invalid. Please refer to the configuration specification."
-        })
+        Config::from_str(&s).with_context(
+            || "Configuration is invalid. Please refer to the configuration specification.",
+        )
     }
 }
 

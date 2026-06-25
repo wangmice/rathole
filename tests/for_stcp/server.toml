@@ -1,0 +1,12 @@
+[server]
+bind_addr = "127.0.0.1:2343"
+default_token = "default_token_if_not_specify"
+
+[server.transport]
+type = "tcp"
+
+[server.services.echo]
+mode = "stcp"
+
+[server.services.pingpong]
+mode = "stcp"

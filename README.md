@@ -92,6 +92,42 @@ Then run:
 
 So you can `ssh myserver.com:5202` to ssh to your NAS.
 
+### STCP-like hidden services
+
+For services that should not expose a public port on the server, use the native `stcp` mode. The server only relays authenticated visitor connections; users connect to a visitor's local port instead.
+
+```toml
+# server.toml
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "use_a_secret_that_only_you_know"
+
+[server.services.my_nas_ssh]
+mode = "stcp"
+```
+
+```toml
+# provider.toml, on the host that owns the hidden service
+[client]
+remote_addr = "myserver.com:2333"
+default_token = "use_a_secret_that_only_you_know"
+
+[client.services.my_nas_ssh]
+local_addr = "127.0.0.1:22"
+```
+
+```toml
+# visitor.toml, on the host that wants to access the hidden service
+[client]
+remote_addr = "myserver.com:2333"
+default_token = "use_a_secret_that_only_you_know"
+
+[client.visitors.my_nas_ssh]
+bind_addr = "127.0.0.1:5202"
+```
+
+Then connect to `127.0.0.1:5202` on the visitor host. See [examples/stcp](./examples/stcp) for complete examples.
+
 To run `rathole` run as a background service on Linux, checkout the [systemd examples](./examples/systemd).
 
 ## Configuration
@@ -157,6 +193,12 @@ retry_interval = 1 # Optional. The interval between retry to connect to the serv
 [client.services.service2] # Multiple services can be defined
 local_addr = "127.0.0.1:1082"
 
+[client.visitors.service3] # A private visitor for a server service with mode = "stcp"
+token = "whatever" # Necessary if `client.default_token` not set
+bind_addr = "127.0.0.1:1083" # Local address where visitor users connect
+nodelay = true # Optional. Same as services
+retry_interval = 1 # Optional. The interval between retries to listen locally/connect to the server
+
 [server]
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
 default_token = "default_token_if_not_specify" # Optional
@@ -197,12 +239,16 @@ tls = true # If `true` then it will use settings in `server.transport.tls`
 
 [server.services.service1] # The service name must be identical to the client side
 type = "tcp" # Optional. Same as the client `[client.services.X.type]
+mode = "public" # Optional. Possible values: ["public", "stcp"]. Default: "public"
 token = "whatever" # Necessary if `server.default_token` not set
-bind_addr = "0.0.0.0:8081" # Necessary. The address of the service is exposed at. Generally only the port needs to be change.
+bind_addr = "0.0.0.0:8081" # Necessary for public services. stcp services do not expose a public service port.
 nodelay = true # Optional. Same as the client
 
 [server.services.service2]
 bind_addr = "0.0.0.1:8082"
+
+[server.services.service3]
+mode = "stcp"
 ```
 
 ### Logging
