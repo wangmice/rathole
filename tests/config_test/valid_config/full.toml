@@ -38,6 +38,10 @@ local_addr = "127.0.0.1:1082"
 [client.visitors.service3]
 bind_addr = "127.0.0.1:1083"
 
+[client.visitors.service4]
+type = "udp"
+bind_addr = "127.0.0.1:1084"
+
 [server]
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change. 
 default_token = "default_token_if_not_specify" # Optional
@@ -76,3 +80,7 @@ bind_addr = "0.0.0.1:8082"
 
 [server.services.service3]
 mode = "stcp"
+
+[server.services.service4]
+type = "udp"
+mode = "sudp"

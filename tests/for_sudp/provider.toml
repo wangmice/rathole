@@ -1,0 +1,14 @@
+[client]
+remote_addr = "127.0.0.1:2353"
+default_token = "default_token_if_not_specify"
+
+[client.transport]
+type = "tcp"
+
+[client.services.echo]
+type = "udp"
+local_addr = "127.0.0.1:8084"
+
+[client.services.pingpong]
+type = "udp"
+local_addr = "127.0.0.1:8085"

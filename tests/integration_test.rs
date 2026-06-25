@@ -23,6 +23,10 @@ const STCP_ECHO_SERVER_ADDR: &str = "127.0.0.1:8082";
 const STCP_PINGPONG_SERVER_ADDR: &str = "127.0.0.1:8083";
 const STCP_ECHO_VISITOR_ADDR: &str = "127.0.0.1:2344";
 const STCP_PINGPONG_VISITOR_ADDR: &str = "127.0.0.1:2345";
+const SUDP_ECHO_SERVER_ADDR: &str = "127.0.0.1:8084";
+const SUDP_PINGPONG_SERVER_ADDR: &str = "127.0.0.1:8085";
+const SUDP_ECHO_VISITOR_ADDR: &str = "127.0.0.1:2354";
+const SUDP_PINGPONG_VISITOR_ADDR: &str = "127.0.0.1:2355";
 const HITTER_NUM: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
@@ -172,6 +176,65 @@ async fn stcp() -> Result<()> {
 
     tcp_echo_hitter(STCP_ECHO_VISITOR_ADDR).await?;
     tcp_pingpong_hitter(STCP_PINGPONG_VISITOR_ADDR).await?;
+
+    server_shutdown_tx.send(true)?;
+    provider_shutdown_tx.send(true)?;
+    visitor_shutdown_tx.send(true)?;
+
+    let _ = tokio::join!(server, provider, visitor);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sudp() -> Result<()> {
+    init();
+    if cfg!(not(all(feature = "client", feature = "server"))) {
+        return Ok(());
+    }
+
+    tokio::spawn(async move {
+        if let Err(e) = common::udp::echo_server(SUDP_ECHO_SERVER_ADDR).await {
+            panic!("Failed to run the sudp echo server for testing: {:?}", e);
+        }
+    });
+
+    tokio::spawn(async move {
+        if let Err(e) = common::udp::pingpong_server(SUDP_PINGPONG_SERVER_ADDR).await {
+            panic!(
+                "Failed to run the sudp pingpong server for testing: {:?}",
+                e
+            );
+        }
+    });
+
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let (provider_shutdown_tx, provider_shutdown_rx) = broadcast::channel(1);
+    let (visitor_shutdown_tx, visitor_shutdown_rx) = broadcast::channel(1);
+
+    let server = tokio::spawn(async move {
+        run_rathole_server("tests/for_sudp/server.toml", server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    time::sleep(Duration::from_millis(250)).await;
+
+    let provider = tokio::spawn(async move {
+        run_rathole_client("tests/for_sudp/provider.toml", provider_shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    let visitor = tokio::spawn(async move {
+        run_rathole_client("tests/for_sudp/visitor.toml", visitor_shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    time::sleep(Duration::from_millis(2500)).await;
+
+    udp_echo_hitter(SUDP_ECHO_VISITOR_ADDR).await?;
+    udp_pingpong_hitter(SUDP_PINGPONG_VISITOR_ADDR).await?;
 
     server_shutdown_tx.send(true)?;
     provider_shutdown_tx.send(true)?;

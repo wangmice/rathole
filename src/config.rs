@@ -87,6 +87,8 @@ impl ClientServiceConfig {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ClientVisitorConfig {
+    #[serde(rename = "type", default = "default_service_type")]
+    pub service_type: ServiceType,
     #[serde(skip)]
     pub name: String,
     pub bind_addr: String,
@@ -124,6 +126,8 @@ pub enum ServerServiceMode {
     Public,
     #[serde(rename = "stcp")]
     Stcp,
+    #[serde(rename = "sudp")]
+    Sudp,
 }
 
 fn default_server_service_mode() -> ServerServiceMode {
@@ -436,8 +440,12 @@ impl Config {
             if s.mode == ServerServiceMode::Public && s.bind_addr.is_empty() {
                 bail!("The bind_addr of service {} is not set", name);
             }
-            if s.mode == ServerServiceMode::Stcp && s.service_type != ServiceType::Tcp {
-                bail!("stcp service {} only supports tcp", name);
+            match (s.mode, s.service_type) {
+                (ServerServiceMode::Stcp, ServiceType::Tcp)
+                | (ServerServiceMode::Sudp, ServiceType::Udp)
+                | (ServerServiceMode::Public, _) => {}
+                (ServerServiceMode::Stcp, _) => bail!("stcp service {} only supports tcp", name),
+                (ServerServiceMode::Sudp, _) => bail!("sudp service {} only supports udp", name),
             }
         }
 

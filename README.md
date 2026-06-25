@@ -92,9 +92,9 @@ Then run:
 
 So you can `ssh myserver.com:5202` to ssh to your NAS.
 
-### STCP-like hidden services
+### STCP/SUDP-like hidden services
 
-For services that should not expose a public port on the server, use the native `stcp` mode. The server only relays authenticated visitor connections; users connect to a visitor's local port instead.
+For services that should not expose a public port on the server, use the native `stcp` or `sudp` mode. The server only relays authenticated visitor connections; users connect to a visitor's local port instead.
 
 ```toml
 # server.toml
@@ -126,7 +126,7 @@ default_token = "use_a_secret_that_only_you_know"
 bind_addr = "127.0.0.1:5202"
 ```
 
-Then connect to `127.0.0.1:5202` on the visitor host. See [examples/stcp](./examples/stcp) for complete examples.
+Then connect to `127.0.0.1:5202` on the visitor host. UDP services use the same shape with `type = "udp"` and `mode = "sudp"`; see [examples/stcp](./examples/stcp) and [examples/sudp](./examples/sudp) for complete examples.
 
 To run `rathole` run as a background service on Linux, checkout the [systemd examples](./examples/systemd).
 
@@ -193,7 +193,8 @@ retry_interval = 1 # Optional. The interval between retry to connect to the serv
 [client.services.service2] # Multiple services can be defined
 local_addr = "127.0.0.1:1082"
 
-[client.visitors.service3] # A private visitor for a server service with mode = "stcp"
+[client.visitors.service3] # A private visitor for a server service with mode = "stcp" or "sudp"
+type = "tcp" # Optional. Possible values: ["tcp", "udp"]. Default: "tcp"
 token = "whatever" # Necessary if `client.default_token` not set
 bind_addr = "127.0.0.1:1083" # Local address where visitor users connect
 nodelay = true # Optional. Same as services
@@ -239,9 +240,9 @@ tls = true # If `true` then it will use settings in `server.transport.tls`
 
 [server.services.service1] # The service name must be identical to the client side
 type = "tcp" # Optional. Same as the client `[client.services.X.type]
-mode = "public" # Optional. Possible values: ["public", "stcp"]. Default: "public"
+mode = "public" # Optional. Possible values: ["public", "stcp", "sudp"]. Default: "public"
 token = "whatever" # Necessary if `server.default_token` not set
-bind_addr = "0.0.0.0:8081" # Necessary for public services. stcp services do not expose a public service port.
+bind_addr = "0.0.0.0:8081" # Necessary for public services. stcp/sudp services do not expose a public service port.
 nodelay = true # Optional. Same as the client
 
 [server.services.service2]
@@ -249,6 +250,10 @@ bind_addr = "0.0.0.1:8082"
 
 [server.services.service3]
 mode = "stcp"
+
+[server.services.service4]
+type = "udp"
+mode = "sudp"
 ```
 
 ### Logging

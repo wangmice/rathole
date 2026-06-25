@@ -486,12 +486,10 @@ async fn do_visitor_channel_handshake<T: 'static + Transport>(
         }
     };
 
-    if service_config.mode != ServerServiceMode::Stcp
-        || service_config.service_type != ServiceType::Tcp
-    {
+    if service_config.mode == ServerServiceMode::Public {
         conn.write_all(&protocol::encode(&Ack::Unsupported).unwrap())
             .await?;
-        bail!("Service {} is not a tcp stcp service", service_config.name);
+        bail!("Service {} is not a private service", service_config.name);
     }
 
     T::hint(&conn, SocketOpts::from_server_cfg(&service_config));
@@ -515,19 +513,19 @@ async fn do_visitor_channel_handshake<T: 'static + Transport>(
         );
     }
 
-    let stcp_visitor_tx = {
+    let private_visitor_tx = {
         let control_channels_guard = control_channels.read().await;
         match control_channels_guard.get1(&service_digest) {
-            Some(handle) => handle.stcp_visitor_tx.clone(),
+            Some(handle) => handle.private_visitor_tx.clone(),
             None => None,
         }
     };
 
-    let Some(stcp_visitor_tx) = stcp_visitor_tx else {
+    let Some(private_visitor_tx) = private_visitor_tx else {
         conn.write_all(&protocol::encode(&Ack::NoClient).unwrap())
             .await?;
         bail!(
-            "No client available for stcp service {}",
+            "No client available for private service {}",
             service_config.name
         );
     };
@@ -535,10 +533,10 @@ async fn do_visitor_channel_handshake<T: 'static + Transport>(
     conn.write_all(&protocol::encode(&Ack::Ok).unwrap()).await?;
     conn.flush().await?;
 
-    stcp_visitor_tx
+    private_visitor_tx
         .send(conn)
         .await
-        .with_context(|| "stcp visitor channel for a stale control channel")?;
+        .with_context(|| "private visitor channel for a stale control channel")?;
 
     Ok(())
 }
@@ -547,7 +545,7 @@ pub struct ControlChannelHandle<T: Transport> {
     // Shutdown the control channel by dropping it
     _shutdown_tx: broadcast::Sender<bool>,
     data_ch_tx: mpsc::Sender<T::Stream>,
-    stcp_visitor_tx: Option<mpsc::Sender<T::Stream>>,
+    private_visitor_tx: Option<mpsc::Sender<T::Stream>>,
     service: ServerServiceConfig,
 }
 
@@ -577,7 +575,7 @@ where
         let (data_ch_req_tx, data_ch_req_rx) = mpsc::unbounded_channel();
 
         let shutdown_rx_clone = shutdown_tx.subscribe();
-        let stcp_visitor_tx = match (service.mode, service.service_type) {
+        let private_visitor_tx = match (service.mode, service.service_type) {
             (ServerServiceMode::Public, ServiceType::Tcp) => {
                 let bind_addr = service.bind_addr.clone();
                 tokio::spawn(
@@ -647,8 +645,29 @@ where
                 );
                 Some(stcp_visitor_tx)
             }
-            (ServerServiceMode::Stcp, ServiceType::Udp) => {
-                unreachable!("stcp udp services are rejected during configuration validation")
+            (ServerServiceMode::Sudp, ServiceType::Udp) => {
+                let (sudp_visitor_tx, sudp_visitor_rx) = mpsc::channel(CHAN_SIZE);
+                tokio::spawn(
+                    async move {
+                        if let Err(e) = run_sudp_connection_pool::<T>(
+                            data_ch_rx,
+                            data_ch_req_tx,
+                            sudp_visitor_rx,
+                            shutdown_rx_clone,
+                        )
+                        .await
+                        .with_context(|| "Failed to run SUDP connection pool")
+                        {
+                            error!("{:#}", e);
+                        }
+                    }
+                    .instrument(Span::current()),
+                );
+                Some(sudp_visitor_tx)
+            }
+            (ServerServiceMode::Stcp, ServiceType::Udp)
+            | (ServerServiceMode::Sudp, ServiceType::Tcp) => {
+                unreachable!("invalid private service modes are rejected during config validation")
             }
         };
 
@@ -689,7 +708,7 @@ where
         ControlChannelHandle {
             _shutdown_tx: shutdown_tx,
             data_ch_tx,
-            stcp_visitor_tx,
+            private_visitor_tx,
             service,
         }
     }
@@ -1346,6 +1365,103 @@ async fn run_stcp_connection_pool<T: 'static + Transport>(
     }
 
     info!("STCP pool dropped");
+    Ok(())
+}
+
+async fn forward_sudp_pair<S>(visitor: S, data_channel: S) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut visitor_rd, mut visitor_wr) = io::split(visitor);
+    let (mut data_rd, mut data_wr) = io::split(data_channel);
+
+    let visitor_to_data = async {
+        loop {
+            let hdr_len = visitor_rd.read_u8().await?;
+            let packet = UdpTraffic::read(&mut visitor_rd, hdr_len)
+                .await
+                .with_context(|| "Failed to read SUDP traffic from visitor")?;
+            packet
+                .write(&mut data_wr)
+                .await
+                .with_context(|| "Failed to forward SUDP traffic to provider")?;
+        }
+    };
+
+    let data_to_visitor = async {
+        loop {
+            let hdr_len = data_rd.read_u8().await?;
+            let packet = UdpTraffic::read(&mut data_rd, hdr_len)
+                .await
+                .with_context(|| "Failed to read SUDP traffic from provider")?;
+            packet
+                .write(&mut visitor_wr)
+                .await
+                .with_context(|| "Failed to forward SUDP traffic to visitor")?;
+        }
+    };
+
+    tokio::select! {
+        result = visitor_to_data => result,
+        result = data_to_visitor => result,
+    }
+}
+
+#[instrument(skip_all)]
+async fn run_sudp_connection_pool<T: 'static + Transport>(
+    mut data_ch_rx: mpsc::Receiver<T::Stream>,
+    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    mut sudp_visitor_rx: mpsc::Receiver<T::Stream>,
+    mut shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
+    let cmd = protocol::encode(&DataChannelCmd::StartForwardUdp).unwrap();
+    let wait_timeout = Duration::from_secs(STCP_DATA_CHANNEL_WAIT_TIMEOUT);
+
+    loop {
+        tokio::select! {
+            visitor = sudp_visitor_rx.recv() => {
+                let Some(visitor) = visitor else {
+                    break;
+                };
+
+                if data_ch_req_tx.send(true).is_err() {
+                    break;
+                }
+
+                let data_channel = time::timeout(wait_timeout, data_ch_rx.recv()).await;
+                let Some(mut data_channel) = data_channel.ok().flatten() else {
+                    warn!("Dropped sudp visitor because no data channel arrived in time");
+                    continue;
+                };
+
+                match time::timeout(
+                    Duration::from_secs(TCP_DATA_CHANNEL_REQUEST_TIMEOUT),
+                    write_and_flush(&mut data_channel, &cmd),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        tokio::spawn(async move {
+                            if let Err(e) = forward_sudp_pair(visitor, data_channel).await {
+                                warn!("SUDP forwarder ended with error: {:#}", e);
+                            }
+                        });
+                    }
+                    Ok(Err(e)) => {
+                        debug!("Dropping sudp data channel that rejected start command: {:#}", e);
+                    }
+                    Err(_) => {
+                        debug!("Dropping sudp data channel that timed out on start command");
+                    }
+                }
+            }
+            _ = shutdown_rx.recv() => {
+                break;
+            }
+        }
+    }
+
+    info!("SUDP pool dropped");
     Ok(())
 }
 

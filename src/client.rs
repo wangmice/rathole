@@ -356,10 +356,9 @@ struct RunVisitorConnectionArgs<T: Transport> {
     post_half_close_idle_timeout: Option<Duration>,
 }
 
-async fn run_visitor_connection<T: Transport>(
-    local: TcpStream,
+async fn connect_visitor_channel<T: Transport>(
     args: Arc<RunVisitorConnectionArgs<T>>,
-) -> Result<()> {
+) -> Result<T::Stream> {
     let mut conn = args
         .connector
         .connect(&args.remote_addr)
@@ -393,9 +392,52 @@ async fn run_visitor_connection<T: Transport>(
         }
     }
 
+    Ok(conn)
+}
+
+async fn run_visitor_connection<T: Transport>(
+    local: TcpStream,
+    args: Arc<RunVisitorConnectionArgs<T>>,
+) -> Result<()> {
+    let conn = connect_visitor_channel(args.clone()).await?;
+
     if let Err(e) = T::forward_tcp(conn, local, args.post_half_close_idle_timeout).await {
         log_forwarder_outcome("stcp visitor", &e);
     }
+    Ok(())
+}
+
+async fn run_udp_visitor<T: Transport>(
+    socket: UdpSocket,
+    args: Arc<RunVisitorConnectionArgs<T>>,
+    shutdown_rx: &mut oneshot::Receiver<u8>,
+) -> Result<()> {
+    let mut conn = connect_visitor_channel(args).await?;
+    let mut buf = [0u8; UDP_BUFFER_SIZE];
+
+    loop {
+        tokio::select! {
+            val = socket.recv_from(&mut buf) => {
+                let (len, from) = val.with_context(|| "Failed to read UDP packet from local visitor")?;
+                UdpTraffic::write_slice(&mut conn, from, &buf[..len])
+                    .await
+                    .with_context(|| "Failed to forward UDP packet to server")?;
+            }
+            hdr_len = conn.read_u8() => {
+                let packet = UdpTraffic::read(&mut conn, hdr_len?)
+                    .await
+                    .with_context(|| "Failed to read UDP packet from server")?;
+                socket
+                    .send_to(&packet.data, packet.from)
+                    .await
+                    .with_context(|| "Failed to write UDP packet to local visitor")?;
+            }
+            _ = &mut *shutdown_rx => {
+                break;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -415,11 +457,6 @@ struct VisitorHandle {
 impl<T: 'static + Transport> Visitor<T> {
     #[instrument(skip_all, fields(visitor = %self.visitor.name))]
     async fn run(&mut self) -> Result<()> {
-        let l = TcpListener::bind(&self.visitor.bind_addr)
-            .await
-            .with_context(|| format!("Failed to listen at {}", self.visitor.bind_addr))?;
-        info!("Visitor listening at {}", self.visitor.bind_addr);
-
         let mut remote_addr = AddrMaybeCached::new(&self.remote_addr);
         remote_addr.resolve().await?;
 
@@ -432,6 +469,18 @@ impl<T: 'static + Transport> Visitor<T> {
             visitor: self.visitor.clone(),
             post_half_close_idle_timeout: self.post_half_close_idle_timeout,
         });
+
+        match self.visitor.service_type {
+            ServiceType::Tcp => self.run_tcp(args).await,
+            ServiceType::Udp => self.run_udp(args).await,
+        }
+    }
+
+    async fn run_tcp(&mut self, args: Arc<RunVisitorConnectionArgs<T>>) -> Result<()> {
+        let l = TcpListener::bind(&self.visitor.bind_addr)
+            .await
+            .with_context(|| format!("Failed to listen at {}", self.visitor.bind_addr))?;
+        info!("Visitor listening at {}", self.visitor.bind_addr);
 
         loop {
             tokio::select! {
@@ -458,6 +507,18 @@ impl<T: 'static + Transport> Visitor<T> {
                 }
             }
         }
+
+        info!("Visitor shutdown");
+        Ok(())
+    }
+
+    async fn run_udp(&mut self, args: Arc<RunVisitorConnectionArgs<T>>) -> Result<()> {
+        let socket = UdpSocket::bind(&self.visitor.bind_addr)
+            .await
+            .with_context(|| format!("Failed to listen at {}", self.visitor.bind_addr))?;
+        info!("UDP visitor listening at {}", self.visitor.bind_addr);
+
+        run_udp_visitor(socket, args, &mut self.shutdown_rx).await?;
 
         info!("Visitor shutdown");
         Ok(())

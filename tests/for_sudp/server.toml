@@ -1,0 +1,14 @@
+[server]
+bind_addr = "127.0.0.1:2353"
+default_token = "default_token_if_not_specify"
+
+[server.transport]
+type = "tcp"
+
+[server.services.echo]
+type = "udp"
+mode = "sudp"
+
+[server.services.pingpong]
+type = "udp"
+mode = "sudp"

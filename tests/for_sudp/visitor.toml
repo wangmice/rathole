@@ -1,0 +1,14 @@
+[client]
+remote_addr = "127.0.0.1:2353"
+default_token = "default_token_if_not_specify"
+
+[client.transport]
+type = "tcp"
+
+[client.visitors.echo]
+type = "udp"
+bind_addr = "127.0.0.1:2354"
+
+[client.visitors.pingpong]
+type = "udp"
+bind_addr = "127.0.0.1:2355"
