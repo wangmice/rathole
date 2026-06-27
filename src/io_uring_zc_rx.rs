@@ -8,7 +8,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
-use self::sys::{start_zc_rx, ZcRxReadHalf};
+use self::sys::{ZcRxReadHalf, start_zc_rx};
 
 pub struct MaybeZcRxTcpStream {
     rx: Option<ZcRxReadHalf>,
@@ -187,7 +187,7 @@ mod sys {
 #[cfg(target_os = "linux")]
 mod sys {
     use crate::config::IoUringZcRxConfig;
-    use io_uring::{cqueue, opcode, squeue, types, IoUring, Probe};
+    use io_uring::{IoUring, Probe, cqueue, opcode, squeue, types};
     use std::convert::TryFrom;
     use std::ffi::{CStr, CString};
     use std::io;
@@ -491,17 +491,19 @@ mod sys {
             rqes_offset: u32,
             entries: u32,
         ) -> io::Result<Self> {
-            Ok(Self {
-                head: checked_offset::<u32>(memory, head_offset, 1)? as *const u32,
-                tail: checked_offset::<u32>(memory, tail_offset, 1)?,
-                rqes: checked_offset::<types::io_uring_zcrx_rqe>(
-                    memory,
-                    rqes_offset,
-                    entries as usize,
-                )?,
-                entries,
-                local_tail: ptr::read_volatile(checked_offset::<u32>(memory, tail_offset, 1)?),
-            })
+            unsafe {
+                Ok(Self {
+                    head: checked_offset::<u32>(memory, head_offset, 1)? as *const u32,
+                    tail: checked_offset::<u32>(memory, tail_offset, 1)?,
+                    rqes: checked_offset::<types::io_uring_zcrx_rqe>(
+                        memory,
+                        rqes_offset,
+                        entries as usize,
+                    )?,
+                    entries,
+                    local_tail: ptr::read_volatile(checked_offset::<u32>(memory, tail_offset, 1)?),
+                })
+            }
         }
 
         fn recycle(&mut self, offset: u64, len: u32, area_token: u64) -> io::Result<()> {
@@ -550,7 +552,7 @@ mod sys {
                 "io_uring ZC Rx refill ring offsets are out of bounds",
             ));
         }
-        Ok(memory.as_ptr().add(offset).cast())
+        unsafe { Ok(memory.as_ptr().add(offset).cast()) }
     }
 
     struct MmapRegion {
