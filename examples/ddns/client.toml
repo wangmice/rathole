@@ -1,0 +1,16 @@
+# Client example: domain `remote_addr` with optional custom DNS upstream.
+#
+# Resolution order for the domain in `remote_addr`:
+#   1. TXT record — base64-encoded "ipv4:port" (e.g. echo -n "1.2.3.4:2333" | base64)
+#   2. IP4P — AAAA like 2001:0000:0000:0000:0000:PORT:IP_HI:IP_LO (NATMap / heiher-frp style)
+#   3. Standard A/AAAA — uses the port from `remote_addr` (e.g. :2333 below)
+#
+# Use :0 in remote_addr when the port is supplied by TXT or IP4P.
+
+[client]
+remote_addr = "myserver.example.com:0"
+default_token = "use_a_secret_that_only_you_know"
+dns = ["114.114.114.114", "8.8.8.8:53"]
+
+[client.services.my_service]
+local_addr = "127.0.0.1:8080"

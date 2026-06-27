@@ -113,6 +113,7 @@ struct Client<T: Transport> {
 impl<T: 'static + Transport> Client<T> {
     // Create a Client from `[client]` config block
     async fn from(config: ClientConfig) -> Result<Client<T>> {
+        crate::resolver::init(&config.dns).with_context(|| "Failed to initialize DNS resolver")?;
         let transport =
             Arc::new(T::new(&config.transport).with_context(|| "Failed to create the transport")?);
         Ok(Client {

@@ -128,6 +128,24 @@ bind_addr = "127.0.0.1:5202"
 
 Then connect to `127.0.0.1:5202` on the visitor host. UDP services use the same shape with `type = "udp"` and `mode = "sudp"`; see [examples/stcp](./examples/stcp) and [examples/sudp](./examples/sudp) for complete examples.
 
+### Dynamic server address (DDNS / TXT / IP4P)
+
+When `remote_addr` uses a **domain name**, the client resolves it in order: **TXT** (base64-encoded `ip:port`) → **IP4P** (AAAA records with prefix `2001::/80`) → **standard A/AAAA** lookup. IP literals skip this chain.
+
+Use `remote_addr = "example.com:0"` when the port comes from TXT or IP4P records. Use `remote_addr = "example.com:2333"` when falling back to normal DNS and the port is fixed in config.
+
+Optional custom DNS upstreams (omit to use the system resolver):
+
+```toml
+[client]
+remote_addr = "example.com:0"
+dns = ["114.114.114.114", "8.8.8.8:53"] # Optional. Use "system" to force the OS resolver.
+```
+
+TXT record example: store base64 of `203.0.113.10:2333` (`MjAzLjAuMTEzLjEwOjIzMzM=`).
+
+See [examples/ddns](./examples/ddns) for a minimal client config.
+
 To run `rathole` run as a background service on Linux, checkout the [systemd examples](./examples/systemd).
 
 ## Configuration
@@ -145,6 +163,7 @@ Here is the full configuration specification:
 ```toml
 [client]
 remote_addr = "example.com:2333" # Necessary. The address of the server
+# dns = ["114.114.114.114", "8.8.8.8:53"] # Optional. Custom DNS upstreams for resolving `remote_addr` when it is a domain. Empty or omitted uses the system resolver. Each entry: IP, `ip:port`, or `dns://ip:port`. Use `"system"` alone to force the OS resolver.
 default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
 heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `server.heartbeat_interval`. Default: 40 seconds
 retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: 1 second

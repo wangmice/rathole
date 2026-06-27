@@ -20,6 +20,8 @@ mod protocol;
 mod tcp_quickack;
 mod transport;
 
+mod somark;
+
 pub use cli::Cli;
 use cli::KeypairType;
 pub use config::Config;
@@ -29,6 +31,8 @@ use anyhow::Result;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
+#[cfg(feature = "client")]
+mod resolver;
 #[cfg(feature = "client")]
 mod client;
 #[cfg(feature = "client")]

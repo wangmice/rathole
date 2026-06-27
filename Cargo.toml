@@ -2,7 +2,6 @@
 name = "rathole"
 version = "0.6.0"
 edition = "2024"
-authors = ["Yujia Qiao <code@rapiz.me>", "VeroFess <admin@binklac.com>"]
 description = "A reverse proxy for NAT traversal"
 license = "Apache-2.0"
 repository = "https://github.com/verofess/rathole-ng"
@@ -23,7 +22,7 @@ default = [
 # Run as a server
 server = []
 # Run as a client
-client = []
+client = ["dep:hickory-resolver", "dep:base64"]
 
 # TLS support
 native-tls = ["tokio-native-tls", "openssl"]
@@ -35,7 +34,7 @@ rustls = [
 ]
 
 # Noise support
-noise = ["snowstorm", "base64"]
+noise = ["snowstorm", "dep:base64"]
 
 # Websocket support
 websocket-native-tls = [
@@ -106,6 +105,10 @@ snowstorm = { version = "0.4", optional = true, features = [
     "stream",
 ], default-features = false }
 base64 = { version = "0.22", optional = true }
+hickory-resolver = { version = "0.26", optional = true, default-features = false, features = [
+    "tokio",
+    "system-config",
+] }
 notify = { version = "8.2", optional = true }
 console-subscriber = { version = "0.5", optional = true, features = [
     "parking_lot",

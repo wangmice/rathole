@@ -1,7 +1,9 @@
 use crate::config::{
     ClientServiceConfig, ClientVisitorConfig, ServerServiceConfig, TcpConfig, TransportConfig,
 };
-use crate::helper::{to_socket_addr, try_set_tcp_keepalive};
+#[cfg(not(feature = "client"))]
+use crate::helper::to_socket_addr;
+use crate::helper::try_set_tcp_keepalive;
 use anyhow::{Context, Result};
 use std::fmt::{Debug, Display};
 use std::future::Future;
@@ -32,13 +34,18 @@ impl AddrMaybeCached {
     }
 
     pub async fn resolve(&mut self) -> Result<()> {
-        match to_socket_addr(&self.addr).await {
-            Ok(s) => {
-                self.socket_addr = Some(s);
-                Ok(())
+        let socket_addr = {
+            #[cfg(feature = "client")]
+            {
+                crate::resolver::resolve_client_remote_addr(&self.addr).await?
             }
-            Err(e) => Err(e),
-        }
+            #[cfg(not(feature = "client"))]
+            {
+                to_socket_addr(&self.addr).await?
+            }
+        };
+        self.socket_addr = Some(socket_addr);
+        Ok(())
     }
 }
 

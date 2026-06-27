@@ -3,8 +3,8 @@ use std::net::SocketAddr;
 use super::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use crate::config::{NoiseConfig, TransportConfig};
 use crate::io_uring_zc_rx::MaybeZcRxTcpStream;
-use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use snowstorm::{Builder, NoiseParams, NoiseStream};
 use tokio::net::{TcpListener, ToSocketAddrs};
 

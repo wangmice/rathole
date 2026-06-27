@@ -381,6 +381,9 @@ pub struct ClientConfig {
     pub retry_interval: u64,
     #[serde(default = "default_post_half_close_idle_timeout")]
     pub post_half_close_idle_timeout: PostHalfCloseIdleTimeout,
+    /// Custom DNS upstream servers. Empty uses system DNS.
+    #[serde(default)]
+    pub dns: Vec<String>,
 }
 
 fn default_heartbeat_interval() -> u64 {
@@ -480,6 +483,15 @@ impl Config {
             if v.retry_interval.is_none() {
                 v.retry_interval = Some(client.retry_interval);
             }
+        }
+
+        #[cfg(feature = "client")]
+        for server in &client.dns {
+            if server == "system" {
+                continue;
+            }
+            crate::resolver::validate_dns_upstream(server)
+                .with_context(|| format!("invalid client DNS upstream {server:?}"))?;
         }
 
         Config::validate_transport_config(&client.transport, false)?;

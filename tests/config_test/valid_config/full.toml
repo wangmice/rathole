@@ -1,5 +1,6 @@
 [client]
 remote_addr = "example.com:2333" # Necessary. The address of the server
+# dns = ["114.114.114.114", "8.8.8.8:53"] # Optional. Custom DNS upstreams when `remote_addr` is a domain. Empty uses system DNS.
 default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
 
 [client.transport]
