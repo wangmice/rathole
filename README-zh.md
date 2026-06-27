@@ -91,7 +91,65 @@ local_addr = "127.0.0.1:22" # 需要被转发的服务的地址
 
 所以你可以 `ssh myserver.com:5202` 来 ssh 到你的 NAS。
 
-[Systemd examples](./examples/systemd) 中提供了一些让 `rathole` 在 Linux 上作为后台服务运行的配置示例。
+### STCP/SUDP 隐藏服务
+
+若不想在服务端暴露公网端口，可使用原生 `stcp` 或 `sudp` 模式。服务端只转发经认证的 visitor 连接；用户访问 visitor 主机上的本地端口即可。
+
+```toml
+# server.toml
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "use_a_secret_that_only_you_know"
+
+[server.services.my_nas_ssh]
+mode = "stcp"
+```
+
+```toml
+# provider.toml，运行隐藏服务的主机
+[client]
+remote_addr = "myserver.com:2333"
+default_token = "use_a_secret_that_only_you_know"
+
+[client.services.my_nas_ssh]
+local_addr = "127.0.0.1:22"
+```
+
+```toml
+# visitor.toml，需要访问隐藏服务的主机
+[client]
+remote_addr = "myserver.com:2333"
+default_token = "use_a_secret_that_only_you_know"
+
+[client.visitors.my_nas_ssh]
+bind_addr = "127.0.0.1:5202"
+```
+
+在 visitor 主机上连接 `127.0.0.1:5202` 即可。UDP 服务使用相同结构，设 `type = "udp"` 与 `mode = "sudp"`；完整示例见 [examples/stcp](./examples/stcp) 与 [examples/sudp](./examples/sudp)。
+
+### 动态服务端地址（DDNS / TXT / IP4P）
+
+当 `remote_addr` 使用**域名**时，客户端按顺序解析：**TXT**（base64 编码的 `ip:port`）→ **IP4P**（前缀 `2001::/80` 的 AAAA）→ **标准 A/AAAA**。IP 字面量跳过此链路。
+
+支持的 `remote_addr` 形式：`example.com:2333`、`127.0.0.1:2333`、`[::1]:2333`（IPv6 推荐加方括号）或 `::1:2333`。
+
+端口来自 TXT/IP4P 时用 `remote_addr = "example.com:0"`；走普通 DNS 且端口固定时用 `remote_addr = "example.com:2333"`。
+
+控制通道保持连接期间会复用首次解析的 IP，直到断线重连。修改配置中的 `remote_addr` 或 `dns` 会触发**整 client 重启**（增量热重载仅增删 service/visitor）。
+
+可选自定义 DNS 上游（省略则使用系统 DNS）：
+
+```toml
+[client]
+remote_addr = "example.com:0"
+dns = ["114.114.114.114", "8.8.8.8:53"] # 单独写 "system" 可强制使用系统解析器
+```
+
+TXT 示例：存储 `203.0.113.10:2333` 的 base64（`MjAzLjAuMTEzLjEwOjIzMzM=`）。
+
+最小示例见 [examples/ddns](./examples/ddns)。
+
+在 Linux 上以后台服务运行，参见 [systemd 示例](./examples/systemd)。
 
 ## Configuration
 
@@ -107,71 +165,26 @@ local_addr = "127.0.0.1:22" # 需要被转发的服务的地址
 
 ```toml
 [client]
-remote_addr = "example.com:2333" # Necessary. The address of the server
-default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
-heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `server.heartbeat_interval`. Default: 40 seconds
-retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: 1 second
+remote_addr = "example.com:2333" # 必填。服务端地址：域名:端口、IPv4（127.0.0.1:2333）或 IPv6（[::1]:2333）。IP 字面量不走 DDNS 解析
+# dns = ["114.114.114.114", "8.8.8.8:53"] # 可选。`remote_addr` 为域名时使用的 DNS 上游。省略则用系统 DNS。每项可为 IP、`ip:port` 或 `dns://ip:port`；仅写 "system" 则强制系统解析器
+default_token = "default_token_if_not_specify" # 可选。各 service 未单独设置 token 时的默认值
+heartbeat_timeout = 40 # 可选。应用层心跳超时，0 为禁用；须大于 `server.heartbeat_interval`。默认 40 秒
+retry_interval = 1 # 可选。控制通道重连的指数退避上限（秒）。首次约 500ms，逐步增至该值；无限重试。默认 1
+post_half_close_idle_timeout = 120 # 可选。对端半关闭后的空闲超时，"off" 禁用。默认 120
 
-[client.transport] # The whole block is optional. Specify which transport to use
-type = "tcp" # Optional. Possible values: ["tcp", "tls", "noise"]. Default: "tcp"
+[client.transport] # 整块可选
+type = "tcp" # 可选。tcp / tls / noise。默认 tcp
 
-[client.transport.tcp] # Optional. Also affects `noise` and `tls`
-proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. The proxy used to connect to the server. `http` and `socks5` is supported.
-nodelay = true # Optional. Override the `client.transport.nodelay` per service
-keepalive_secs = 20 # Optional. Specify `tcp_keepalive_time` in `tcp(7)`, if applicable. Default: 20 seconds
-keepalive_interval = 8 # Optional. Specify `tcp_keepalive_intvl` in `tcp(7)`, if applicable. Default: 8 seconds
-fast_open = false # Optional. 在支持的平台上启用 TCP Fast Open。默认: false
-quickack = false # Optional. 每次成功读取 TCP 数据后重新提示 Linux TCP_QUICKACK。默认: false
-msg_zerocopy = false # Optional. Linux MSG_ZEROCOPY 发送路径，用于必须经过用户态的 TCP 写入。默认: false
+[client.transport.tcp] # 可选。也作用于 noise 与 tls
+proxy = "socks5://user:passwd@127.0.0.1:1080" # 可选。连接服务端时使用的代理，支持 http 与 socks5
+nodelay = true # 可选。TCP_NODELAY。默认 true
+keepalive_secs = 20 # 可选。默认 20 秒
+keepalive_interval = 8 # 可选。默认 8 秒
+fast_open = false # 可选。TCP Fast Open。默认 false
+quickack = false # 可选。Linux TCP_QUICKACK。默认 false
+msg_zerocopy = false # 可选。Linux MSG_ZEROCOPY。默认 false
 
-[client.transport.io_uring_zc_rx] # Optional. Experimental Linux io_uring zero-copy receive path. Also affects `tcp`, `tls`, `noise`, and `websocket`.
-enabled = false # Optional. Try io_uring ZC Rx where possible, falling back to regular TCP reads or splice when unavailable. Default: false
-interface = "eth0" # Optional. Network interface name. If omitted, rathole tries to infer it from the socket's local address.
-# interface_index = 2 # Optional alternative to `interface`.
-rx_queue = 0 # Optional. RX queue to register. Default: 0
-ring_entries = 4096 # Optional. Must be a non-zero power of two. Default: 4096
-area_size = 16777216 # Optional. Size of the ZC Rx area in bytes. Default: 16 MiB
-recv_len = 65536 # Optional. Maximum bytes requested per receive completion. Default: 64 KiB
-
-[client.transport.tls] # Necessary if `type` is "tls"
-trusted_root = "ca.pem" # Necessary. The certificate of CA that signed the server's certificate
-hostname = "example.com" # Optional. The hostname that the client uses to validate the certificate. If not set, fallback to `client.remote_addr`
-
-[client.transport.noise] # Noise protocol. See `docs/transport.md` for further explanation
-pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
-local_private_key = "key_encoded_in_base64" # Optional
-remote_public_key = "key_encoded_in_base64" # Optional
-
-[client.transport.websocket] # Necessary if `type` is "websocket"
-tls = true # If `true` then it will use settings in `client.transport.tls`
-
-[client.services.service1] # A service that needs forwarding. The name `service1` can change arbitrarily, as long as identical to the name in the server's configuration
-type = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp"
-token = "whatever" # Necessary if `client.default_token` not set
-local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
-nodelay = true # Optional. Determine whether to enable TCP_NODELAY for data transmission, if applicable, to improve the latency but decrease the bandwidth. Default: true
-retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: inherits the global config
-
-[client.services.service2] # Multiple services can be defined
-local_addr = "127.0.0.1:1082"
-
-[server]
-bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
-default_token = "default_token_if_not_specify" # Optional
-heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
-
-[server.transport] # Same as `[client.transport]`
-type = "tcp"
-
-[server.transport.tcp] # Same as the client
-nodelay = true
-keepalive_secs = 20
-keepalive_interval = 8
-fast_open = false # Optional. 在支持的平台上启用 TCP Fast Open。默认: false
-quickack = false
-msg_zerocopy = false
-
-[server.transport.io_uring_zc_rx] # Same as the client
+[client.transport.io_uring_zc_rx] # 可选。实验性 io_uring 零拷贝接收
 enabled = false
 interface = "eth0"
 # interface_index = 2
@@ -180,26 +193,87 @@ ring_entries = 4096
 area_size = 16777216
 recv_len = 65536
 
-[server.transport.tls] # Necessary if `type` is "tls"
-pkcs12 = "identify.pfx" # Necessary. pkcs12 file of server's certificate and private key
-pkcs12_password = "password" # Necessary. Password of the pkcs12 file
+[client.transport.tls] # type = "tls" 时必填
+trusted_root = "ca.pem"
+hostname = "example.com" # 可选。未设置则回退到 `remote_addr` 中的主机名
 
-[server.transport.noise] # Same as `[client.transport.noise]`
+[client.transport.noise] # 见 docs/transport.md
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
 local_private_key = "key_encoded_in_base64"
 remote_public_key = "key_encoded_in_base64"
 
-[server.transport.websocket] # Necessary if `type` is "websocket"
-tls = true # If `true` then it will use settings in `server.transport.tls`
+[client.transport.websocket]
+tls = true
 
-[server.services.service1] # The service name must be identical to the client side
-type = "tcp" # Optional. Same as the client `[client.services.X.type]
-token = "whatever" # Necessary if `server.default_token` not set
-bind_addr = "0.0.0.0:8081" # Necessary. The address of the service is exposed at. Generally only the port needs to be change.
-nodelay = true # Optional. Same as the client
+[client.services.service1]
+type = "tcp" # 可选。tcp 或 udp。默认 tcp
+token = "whatever" # 未设置 default_token 时必填
+local_addr = "127.0.0.1:1081"
+nodelay = true
+retry_interval = 1 # 可选。继承 `[client] retry_interval`
+
+[client.services.service2]
+local_addr = "127.0.0.1:1082"
+
+[client.visitors.service3] # mode = stcp/sudp 的隐藏服务 visitor
+type = "tcp"
+token = "whatever"
+bind_addr = "127.0.0.1:1083"
+retry_interval = 1
+
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "default_token_if_not_specify"
+heartbeat_interval = 30 # 默认 30 秒
+post_half_close_idle_timeout = 120
+
+[server.transport]
+type = "tcp"
+
+[server.transport.tcp]
+nodelay = true
+keepalive_secs = 20
+keepalive_interval = 8
+fast_open = false
+quickack = false
+msg_zerocopy = false
+
+[server.transport.io_uring_zc_rx]
+enabled = false
+interface = "eth0"
+rx_queue = 0
+ring_entries = 4096
+area_size = 16777216
+recv_len = 65536
+
+[server.transport.tls]
+pkcs12 = "identify.pfx"
+pkcs12_password = "password"
+
+[server.transport.noise]
+pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
+local_private_key = "key_encoded_in_base64"
+remote_public_key = "key_encoded_in_base64"
+
+[server.transport.websocket]
+tls = true
+
+[server.services.service1]
+type = "tcp"
+mode = "public" # 可选。public / stcp / sudp。默认 public
+token = "whatever"
+bind_addr = "0.0.0.0:8081" # public 模式必填；stcp/sudp 不在服务端暴露业务端口
+nodelay = true
 
 [server.services.service2]
 bind_addr = "0.0.0.1:8082"
+
+[server.services.service3]
+mode = "stcp"
+
+[server.services.service4]
+type = "udp"
+mode = "sudp"
 ```
 
 ### Logging

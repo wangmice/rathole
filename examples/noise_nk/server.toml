@@ -1,3 +1,7 @@
+# Noise NK example (server).
+# Generate a keypair: rathole --genkey
+# Keep the Private Key here as local_private_key; give clients the matching Public Key.
+
 [server]
 bind_addr = "0.0.0.0:2333"
 default_token = "123"
@@ -5,7 +9,7 @@ default_token = "123"
 [server.transport]
 type = "noise"
 [server.transport.noise]
-local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM="
+local_private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE="
 
 [server.services.foo1]
 bind_addr = "0.0.0.0:5202"

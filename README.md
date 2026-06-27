@@ -132,7 +132,11 @@ Then connect to `127.0.0.1:5202` on the visitor host. UDP services use the same 
 
 When `remote_addr` uses a **domain name**, the client resolves it in order: **TXT** (base64-encoded `ip:port`) → **IP4P** (AAAA records with prefix `2001::/80`) → **standard A/AAAA** lookup. IP literals skip this chain.
 
+Supported `remote_addr` forms: `example.com:2333`, `127.0.0.1:2333`, `[::1]:2333` (IPv6 bracket form recommended), or `::1:2333`.
+
 Use `remote_addr = "example.com:0"` when the port comes from TXT or IP4P records. Use `remote_addr = "example.com:2333"` when falling back to normal DNS and the port is fixed in config.
+
+While a control channel stays connected, the resolved IP is reused until the channel reconnects. Changing `remote_addr` or `dns` in the config file triggers a **full client restart** (incremental hot reload only adds or removes services/visitors).
 
 Optional custom DNS upstreams (omit to use the system resolver):
 
@@ -162,11 +166,11 @@ Here is the full configuration specification:
 
 ```toml
 [client]
-remote_addr = "example.com:2333" # Necessary. The address of the server
+remote_addr = "example.com:2333" # Necessary. Server address: domain:port, IPv4 (127.0.0.1:2333), or IPv6 ([::1]:2333). IP literals skip DDNS lookup.
 # dns = ["114.114.114.114", "8.8.8.8:53"] # Optional. Custom DNS upstreams for resolving `remote_addr` when it is a domain. Empty or omitted uses the system resolver. Each entry: IP, `ip:port`, or `dns://ip:port`. Use `"system"` alone to force the OS resolver.
 default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
 heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `server.heartbeat_interval`. Default: 40 seconds
-retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: 1 second
+retry_interval = 1 # Optional. Exponential backoff cap (seconds) for control-channel reconnects. First retry ~500ms, then backs off up to this value; retries forever. Default: 1
 post_half_close_idle_timeout = 120 # Optional. Idle deadline applied to a forwarder once one peer has half-closed; see the dedicated section below. Use `"off"` to disable (legacy behavior). Default: 120
 
 [client.transport] # The whole block is optional. Specify which transport to use
@@ -207,7 +211,7 @@ type = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["
 token = "whatever" # Necessary if `client.default_token` not set
 local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
 nodelay = true # Optional. Override the `client.transport.nodelay` per service
-retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: inherits the global config
+retry_interval = 1 # Optional. Exponential backoff cap for this service; inherits `[client] retry_interval` if unset
 
 [client.services.service2] # Multiple services can be defined
 local_addr = "127.0.0.1:1082"
@@ -217,7 +221,7 @@ type = "tcp" # Optional. Possible values: ["tcp", "udp"]. Default: "tcp"
 token = "whatever" # Necessary if `client.default_token` not set
 bind_addr = "127.0.0.1:1083" # Local address where visitor users connect
 nodelay = true # Optional. Same as services
-retry_interval = 1 # Optional. The interval between retries to listen locally/connect to the server
+retry_interval = 1 # Optional. Same backoff semantics as services; inherits global config if unset
 
 [server]
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
