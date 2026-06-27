@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use async_http_proxy::{http_connect_tokio, http_connect_tokio_with_basic_auth};
 use backoff::{backoff::Backoff, Notify};
 #[cfg(target_os = "linux")]
@@ -102,9 +102,44 @@ pub async fn to_socket_addr<A: ToSocketAddrs>(addr: A) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow!("Failed to lookup the host"))
 }
 
+/// Split `domain:port`. For IP literals use [`host_port_pair`].
+pub fn parse_domain_host_port(addr: &str) -> Result<(&str, u16)> {
+    let semi = addr
+        .rfind(':')
+        .ok_or_else(|| anyhow!("missing port in address {addr}"))?;
+    let host = &addr[..semi];
+    let port: u16 = addr[semi + 1..]
+        .parse()
+        .with_context(|| format!("invalid port in address {addr}"))?;
+
+    if host.is_empty() {
+        return Err(anyhow!("empty host in address {addr}"));
+    }
+    if host.contains(':') {
+        return Err(anyhow!(
+            "invalid address {addr}: use bracket form for IPv6, e.g. [::1]:2333"
+        ));
+    }
+    Ok((host, port))
+}
+
 pub fn host_port_pair(s: &str) -> Result<(&str, u16)> {
-    let semi = s.rfind(':').expect("missing semicolon");
-    Ok((&s[..semi], s[semi + 1..].parse()?))
+    if let Ok(sa) = s.parse::<SocketAddr>() {
+        if let Some(rest) = s.strip_prefix('[') {
+            let (inner, after) = rest
+                .split_once(']')
+                .ok_or_else(|| anyhow!("missing ] in address {s}"))?;
+            if !after.starts_with(':') {
+                bail!("missing port after IPv6 address in {s}");
+            }
+            return Ok((inner, sa.port()));
+        }
+        let semi = s
+            .rfind(':')
+            .ok_or_else(|| anyhow!("missing port in address {s}"))?;
+        return Ok((&s[..semi], sa.port()));
+    }
+    parse_domain_host_port(s)
 }
 
 /// Create a UDP socket and connect to `addr`

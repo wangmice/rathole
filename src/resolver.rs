@@ -15,7 +15,7 @@ use tokio::net::lookup_host;
 use tracing::debug;
 use url::Url;
 
-use crate::helper::to_socket_addr;
+use crate::helper::parse_domain_host_port;
 
 static RESOLVER: RwLock<Option<Arc<TokioResolver>>> = RwLock::new(None);
 
@@ -118,11 +118,11 @@ fn parse_host_port(host: &str, port: u16) -> Result<SocketAddr> {
 
 /// Resolve `client.remote_addr` for domain names with TXT → IP4P → standard DNS fallback.
 pub async fn resolve_client_remote_addr(addr: &str) -> Result<SocketAddr> {
-    let (host, config_port) = parse_remote_host_port(addr)?;
-
-    if is_ip_literal(host) {
-        return to_socket_addr(addr).await;
+    if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+        return Ok(socket_addr);
     }
+
+    let (host, config_port) = parse_domain_host_port(addr)?;
 
     let resolver = get_resolver()?;
     let addrs = lookup_host_with_fallback(&resolver, host, config_port).await?;
@@ -131,20 +131,6 @@ pub async fn resolve_client_remote_addr(addr: &str) -> Result<SocketAddr> {
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("no DNS records for {host}"))
-}
-
-fn parse_remote_host_port(addr: &str) -> Result<(&str, u16)> {
-    let semi = addr
-        .rfind(':')
-        .ok_or_else(|| anyhow!("missing port in remote_addr {addr}"))?;
-    let port = addr[semi + 1..]
-        .parse()
-        .with_context(|| format!("invalid port in remote_addr {addr}"))?;
-    Ok((&addr[..semi], port))
-}
-
-fn is_ip_literal(host: &str) -> bool {
-    host.parse::<IpAddr>().is_ok()
 }
 
 async fn lookup_host_with_fallback(
@@ -343,9 +329,30 @@ mod tests {
     }
 
     #[test]
-    fn ip_literal_detection() {
-        assert!(is_ip_literal("127.0.0.1"));
-        assert!(is_ip_literal("::1"));
-        assert!(!is_ip_literal("example.com"));
+    fn remote_addr_ipv6_bracket_parses_as_socket_addr() {
+        let addr: SocketAddr = "[::1]:2333".parse().unwrap();
+        assert_eq!(addr.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(addr.port(), 2333);
+    }
+
+    #[test]
+    fn parse_domain_host_port_parses_domain() {
+        assert_eq!(
+            parse_domain_host_port("example.com:2333").unwrap(),
+            ("example.com", 2333)
+        );
+    }
+
+    #[test]
+    fn parse_domain_host_port_rejects_missing_port() {
+        assert!(parse_domain_host_port("example.com").is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_ipv6_literal_skips_dns() {
+        init(&[]).unwrap();
+        let addr = resolve_client_remote_addr("[::1]:65530").await.unwrap();
+        assert_eq!(addr.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(addr.port(), 65530);
     }
 }
