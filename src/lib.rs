@@ -20,8 +20,6 @@ mod protocol;
 mod tcp_quickack;
 mod transport;
 
-mod somark;
-
 pub use cli::Cli;
 use cli::KeypairType;
 pub use config::Config;
@@ -32,9 +30,9 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 #[cfg(feature = "client")]
-mod resolver;
-#[cfg(feature = "client")]
 mod client;
+#[cfg(feature = "client")]
+mod resolver;
 #[cfg(feature = "client")]
 use client::run_client;
 
@@ -58,7 +56,7 @@ fn get_str_from_keypair_type(curve: KeypairType) -> &'static str {
 
 #[cfg(feature = "noise")]
 fn genkey(curve: Option<KeypairType>) -> Result<()> {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     let curve = curve.unwrap_or(DEFAULT_CURVE);
     let builder = snowstorm::Builder::new(
@@ -193,8 +191,8 @@ mod tests {
 
     #[test]
     fn test_determine_run_mode() {
-        use config::*;
         use RunMode::*;
+        use config::*;
 
         struct T {
             cfg_s: bool,
